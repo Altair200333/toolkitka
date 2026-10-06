@@ -1,0 +1,16 @@
+{
+  "claude_exe": "%USERPROFILE%\\.local\\bin\\claude.exe",
+  "usage_json": "%APPDATA%\\uzalka\\usage.json",
+  "max_snapshot_age_minutes": 120,
+  "fresh_minutes": 5,
+  "switch_below_percent": 10,
+  "new_chat_min_percent": 20,
+  "burn_soon_hours": 6,
+  "leave_with_tasks_below_percent": 2,
+  "face_account": "personal",
+  "route_nested": true,
+  "accounts": [
+    { "name": "personal", "config_dir": "%USERPROFILE%\\.claude" },
+    { "name": "work", "config_dir": "%USERPROFILE%\\.claude-work" }
+  ]
+}

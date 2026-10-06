@@ -1,0 +1,20 @@
+[package]
+name = "claude-router"
+version = "0.1.0"
+edition = "2021"
+description = "Starts claude.exe on the Claude account with the most quota left"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,20 @@
+# Private notes and work artifacts never leave this machine
+docs/notes/
+docs/artifacts/
+
+# Dependencies and build output
+node_modules/
+target/
+uzalka/src-tauri/gen/
+chat-history-mcp/test/tmp/
+
+# Router runtime: the built binary, the real config and its state (logs, chat copies)
+claude-router/bin/
+router.json
+
+# Local settings
+.env
+.env.*
+*.log
+.claude/settings.local.json
+CLAUDE.local.md

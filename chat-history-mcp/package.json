@@ -1,0 +1,22 @@
+{
+  "name": "chat-history-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server: index and search chat history of Claude Code, Codex, OpenCode and t3 code",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.22.3"
+  },
+  "scripts": {
+    "mcp": "node mcp/server.ts",
+    "ingest": "node ops/cli.ts ingest",
+    "test": "node --no-warnings --test \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "koffi": "2.14.1",
+    "snowball-stemmers": "^0.6.0",
+    "zod": "^4.4.3"
+  }
+}

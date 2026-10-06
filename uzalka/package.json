@@ -1,0 +1,15 @@
+{
+  "name": "uzalka",
+  "version": "1.0.0",
+  "description": "Tray app with Claude Code and Codex usage limits",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}
