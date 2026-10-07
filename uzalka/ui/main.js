@@ -17,12 +17,6 @@ function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-function sevColor(p) {
-  if (p >= 90) return "var(--red)";
-  if (p >= 70) return "var(--amber)";
-  return "var(--green)";
-}
-
 function parseReset(v) {
   if (v == null) return null;
   if (typeof v === "number") return new Date(v * 1000);
@@ -34,13 +28,50 @@ function resetText(v) {
   const d = parseReset(v);
   if (!d) return "";
   const ms = d - Date.now();
-  if (ms <= 0) return "resets now";
+  if (ms <= 0) return "now";
   const min = Math.round(ms / 60000);
-  let rel;
-  if (min < 60) rel = `${min}m`;
-  else if (min < 48 * 60) rel = `${Math.floor(min / 60)}h ${min % 60}m`;
-  else rel = `${Math.floor(min / 1440)}d ${Math.floor((min % 1440) / 60)}h`;
-  return `resets in ${rel}`;
+  if (min < 60) return `${min}m`;
+  if (min < 48 * 60) return `${Math.floor(min / 60)}h ${min % 60}m`;
+  return `${Math.floor(min / 1440)}d ${Math.floor((min % 1440) / 60)}h`;
+}
+
+function agoText(ms) {
+  const min = Math.round((Date.now() - ms) / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min}m ago`;
+  return `${Math.floor(min / 60)}h ${min % 60}m ago`;
+}
+
+const clampPct = (p) => Math.max(0, Math.min(100, Number(p) || 0));
+
+// ---- colors ----
+
+// A ring keeps the color of its limit type while usage is fine and turns
+// warm near the limit (same 70 / 90 thresholds as the tray icon).
+const TYPE_GRAD = {
+  session: ["#6b67ff", "#a98bff"],
+  weekly: ["#2f8cff", "#5fd4f4"],
+  model: ["#b66dff", "#ff7cc8"],
+  other: ["#1fbf9a", "#7be3c4"],
+};
+const SEV_GRAD = { warn: ["#f08a24", "#ffc85c"], crit: ["#ff4d5e", "#ff8a4c"] };
+const SEV_TEXT = { ok: "var(--text)", warn: "var(--amber)", crit: "var(--red)" };
+
+function sev(p) {
+  return p >= 90 ? "crit" : p >= 70 ? "warn" : "ok";
+}
+
+function windowType(w) {
+  const label = w.label || "";
+  if (/^session/i.test(label)) return "session";
+  if (label.includes("·")) return "model";
+  if (/^weekly/i.test(label)) return "weekly";
+  return "other";
+}
+
+function gradFor(w, p) {
+  const s = sev(p);
+  return s === "ok" ? TYPE_GRAD[windowType(w)] : SEV_GRAD[s];
 }
 
 // ---- custom tooltip ----
@@ -55,6 +86,7 @@ document.addEventListener("mouseover", (e) => {
   if (!t) return;
   clearTimeout(tipTimer);
   tipTimer = setTimeout(() => {
+    if (!t.isConnected) return; // replaced by a new snapshot meanwhile
     const d = new Date(Number(t.dataset.ts));
     const day = d.toLocaleDateString("en-US", { weekday: "long" });
     const date = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
@@ -74,11 +106,13 @@ document.addEventListener("mouseover", (e) => {
 });
 
 document.addEventListener("mouseout", (e) => {
-  if (e.target.closest && e.target.closest("[data-ts]")) {
-    clearTimeout(tipTimer);
-    tip.classList.remove("show");
-  }
+  if (e.target.closest && e.target.closest("[data-ts]")) hideTip();
 });
+
+function hideTip() {
+  clearTimeout(tipTimer);
+  tip.classList.remove("show");
+}
 
 function brandIcon(kind) {
   return kind === "claude"
@@ -86,79 +120,219 @@ function brandIcon(kind) {
     : `<span class="brand-icon brand-openai" title="Codex">${ICON_OPENAI}</span>`;
 }
 
-function ring(p) {
-  const c = sevColor(p);
-  const deg = Math.max(0, Math.min(100, p)) * 3.6;
-  return `<span class="ring" style="background:
-    radial-gradient(closest-side, var(--card) 54%, transparent 55% 100%),
-    conic-gradient(${c} ${deg}deg, var(--track) 0)"></span>`;
+// ---- rings ----
+
+const RING = 68;
+let gradId = 0;
+
+// items: [{ key, p, g: [from, to] }], outer ring first
+function ringsSvg(items) {
+  const n = Math.max(1, items.length);
+  const gap = n > 3 ? 2 : 2.5;
+  const room = RING / 2 - 1 - 8; // keep a hole for the logo
+  const stroke = Math.min(8, (room - (n - 1) * gap) / n);
+  const c = RING / 2;
+  let r = c - stroke / 2 - 1;
+  let defs = "";
+  let body = "";
+  if (!items.length) {
+    body = `<circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="#ffffff" stroke-opacity=".07" stroke-width="${stroke}"/>`;
+  }
+  items.forEach((it, i) => {
+    const C = 2 * Math.PI * r;
+    const id = `rg${gradId++}`;
+    defs += `<linearGradient id="${id}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${it.g[0]}"/><stop offset="1" stop-color="${it.g[1]}"/></linearGradient>`;
+    body += `<g class="rg" data-i="${i}">
+      <circle cx="${c}" cy="${c}" r="${r}" fill="none" stroke="${it.g[0]}" stroke-opacity=".16" stroke-width="${stroke}"/>
+      <circle class="arc" data-key="${esc(it.key)}" data-c="${C}" data-p="${it.p}" cx="${c}" cy="${c}" r="${r}" fill="none"
+        stroke="url(#${id})" stroke-width="${stroke}" stroke-linecap="round" stroke-dasharray="${C} ${C}"
+        transform="rotate(-90 ${c} ${c})" style="stroke-dashoffset:${C}px;filter:drop-shadow(0 0 3px ${it.g[1]}88)"/>
+    </g>`;
+    r -= stroke + gap;
+  });
+  return `<svg width="${RING}" height="${RING}" viewBox="0 0 ${RING} ${RING}" style="--sw-focus:${(stroke + 1.5).toFixed(2)}px"><defs>${defs}</defs>${body}</svg>`;
 }
 
 // ---- accounts view ----
 
-function agoText(ms) {
-  const min = Math.round((Date.now() - ms) / 60000);
-  if (min < 1) return "just now";
-  if (min < 60) return `${min}m ago`;
-  return `${Math.floor(min / 60)}h ${min % 60}m ago`;
+const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+let popupVisible = false;
+let entering = false;
+let enterTimer = null;
+const shownPct = new Map(); // pct key -> number currently on screen
+let tweenFrame = 0;
+
+function cardHtml(a, index) {
+  const wins = a.windows || [];
+  const items = wins.map((w) => {
+    const p = clampPct(w.percent);
+    return { key: `${a.id}|${w.label}`, p, g: gradFor(w, p), w };
+  });
+  const worst = items.reduce((m, it) => Math.max(m, it.p), 0);
+
+  let body;
+  if (a.error && !wins.length) {
+    const isPause = paused && a.error === paused;
+    body = `<div class="card-note${isPause ? "" : " error"}">${esc(isPause ? "refresh paused" : a.error)}</div>`;
+  } else if (!wins.length) {
+    body = `<div class="card-note">no limit data</div>`;
+  } else {
+    body = items
+      .map((it, i) => {
+        const rd = parseReset(it.w.resets_at);
+        return `<div class="row" data-i="${i}">
+          <span class="dot" style="background:linear-gradient(135deg,${it.g[0]},${it.g[1]})"></span>
+          <span class="lbl">${esc(it.w.label)}</span>
+          <span class="pct num" data-key="${esc(it.key)}" data-to="${Math.round(it.p)}" style="color:${SEV_TEXT[sev(it.p)]}">${Math.round(it.p)}%</span>
+          <span class="reset num" ${rd ? `data-ts="${+rd}"` : ""}>${esc(resetText(it.w.resets_at))}</span>
+        </div>`;
+      })
+      .join("");
+  }
+
+  let chip = "";
+  if (a.stale && wins.length) {
+    const ago = a.updated_ms ? agoText(a.updated_ms) : "";
+    chip = `<span class="chip stale" title="${esc(a.error || "")}">stale · ${esc(ago)}</span>`;
+  } else if (a.credits) {
+    chip = `<span class="chip credits">Credits $${esc(a.credits)}</span>`;
+  }
+  if (a.credits && a.stale && wins.length) body += `<div class="credits-line">Credits: $${esc(a.credits)}</div>`;
+
+  return `
+    <div class="card${sev(worst) === "crit" ? " crit" : ""}${entering && !enterRender ? " no-enter" : ""}" style="--i:${index}" data-id="${esc(a.id)}">
+      <div class="rings">${ringsSvg(items)}<span class="logo-mark">${a.kind === "claude" ? ICON_ANTHROPIC : ICON_OPENAI}</span></div>
+      <div class="main">
+        <div class="top">
+          <span class="acc-name">${esc(a.name)}</span>
+          ${a.plan ? `<span class="plan-badge">${esc(a.plan)}</span>` : ""}
+          <span class="spacer"></span>
+          <button class="icon-btn" title="Hide" data-hide="${esc(a.id)}">${EYE_OPEN}</button>
+        </div>
+        <div class="sub-line">
+          <span class="acc-email" title="${esc(a.email || "")}">${esc(a.email || "")}</span>
+          ${chip}
+        </div>
+        ${body}
+      </div>
+    </div>`;
 }
 
-function renderAccounts() {
+// what the rings show right now (mid-animation included), so a new render
+// continues from there instead of jumping
+function arcsOnScreen(root) {
+  const m = new Map();
+  root.querySelectorAll(".arc").forEach((el) => {
+    const off = parseFloat(getComputedStyle(el).strokeDashoffset);
+    const C = Number(el.dataset.c);
+    if (isFinite(off) && C > 0) m.set(el.dataset.key, 1 - off / C);
+  });
+  return m;
+}
+
+let enterRender = false;
+
+function renderAccounts({ enter = false } = {}) {
   const root = $("view-accounts");
   const visible = snapshot.filter((a) => !a.hidden && !a.duplicate_of);
   const banner = paused ? `<div class="paused-banner">${esc(paused)}</div>` : "";
+  const animate = popupVisible && !reducedMotion.matches;
+  const from = enter ? new Map() : arcsOnScreen(root);
+  hideTip();
   if (!visible.length) {
+    cancelAnimationFrame(tweenFrame);
+    shownPct.clear();
     root.innerHTML = banner + `<div class="empty-state">No accounts found.<br>Add a config path in settings.</div>`;
     return;
   }
-  root.innerHTML = banner + visible
-    .map((a) => {
-      let body;
-      if (a.error && !a.windows.length) {
-        const isPause = paused && a.error === paused;
-        body = `<div class="card-error"${isPause ? ' style="color:var(--muted)"' : ""}>${esc(isPause ? "refresh paused" : a.error)}</div>`;
-      } else if (!a.windows.length) {
-        body = `<div class="card-error" style="color:var(--muted)">no limit data</div>`;
-      } else {
-        body = a.windows
-          .map((w) => {
-            const p = Math.max(0, Math.min(100, w.percent));
-            const rt = resetText(w.resets_at);
-            const rd = parseReset(w.resets_at);
-            return `
-              <div class="limit-line">
-                ${ring(p)}
-                <span class="pct" style="color:${sevColor(p)}">${Math.round(p)}%</span>
-                <span class="lbl">${esc(w.label)}</span>
-                ${rt ? `<span class="reset" ${rd ? `data-ts="${+rd}"` : ""}>· ${esc(rt)}</span>` : ""}
-              </div>`;
-          })
-          .join("");
-        if (a.credits) {
-          body += `<div class="credits-row">Credits: $${esc(a.credits)}</div>`;
-        }
-        if (a.stale) {
-          const ago = a.updated_ms ? agoText(a.updated_ms) : "";
-          body += `<div class="stale-row" title="${esc(a.error || "")}">stale · updated ${ago}</div>`;
-        }
-      }
-      return `
-        <div class="card">
-          <div class="card-head">
-            ${brandIcon(a.kind)}
-            <span class="acc-name">${esc(a.name)}</span>
-            <span class="acc-email" title="${esc(a.email || "")}">${esc(a.email || "")}</span>
-            ${a.plan ? `<span class="plan-badge">${esc(a.plan)}</span>` : ""}
-            <button class="icon-btn" title="Hide" data-hide="${esc(a.id)}">${EYE_OPEN}</button>
-          </div>
-          ${body}
-        </div>`;
-    })
-    .join("");
+  enterRender = enter;
+  root.innerHTML = banner + visible.map(cardHtml).join("");
+  enterRender = false;
 
-  root.querySelectorAll("[data-hide]").forEach((btn) => {
-    btn.addEventListener("click", () => invoke("set_hidden", { id: btn.dataset.hide, hidden: true }));
+  // rings: start where they were (or empty), then let the CSS transition run
+  const arcs = [...root.querySelectorAll(".arc")];
+  for (const el of arcs) {
+    const C = Number(el.dataset.c);
+    const p = Number(el.dataset.p) / 100;
+    const start = animate ? from.get(el.dataset.key) ?? 0 : p;
+    el.style.transition = "none";
+    el.style.strokeDashoffset = `${C * (1 - start)}px`;
+    el.style.opacity = p > 0 || (animate && start > 0) ? "1" : "0";
+  }
+  if (animate) {
+    void root.offsetWidth;
+    for (const el of arcs) {
+      const C = Number(el.dataset.c);
+      const p = Number(el.dataset.p) / 100;
+      const card = el.closest(".card");
+      const ring = Number(el.closest(".rg").dataset.i);
+      const delay = enter ? 140 + Number(card.style.getPropertyValue("--i")) * 45 + ring * 70 : 0;
+      el.style.transition = "";
+      el.style.transitionDelay = `${delay}ms, 0ms, 0ms`;
+      el.style.strokeDashoffset = `${C * (1 - p)}px`;
+      // a 0% ring would leave a round-cap dot behind; fade it once drawn
+      if (p === 0) {
+        el.addEventListener("transitionend", function done(e) {
+          if (e.propertyName !== "stroke-dashoffset") return;
+          el.style.opacity = "0";
+          el.removeEventListener("transitionend", done);
+        });
+      }
+    }
+  }
+  tweenNumbers(root, enter, animate);
+}
+
+const easeOut = (t) => 1 - Math.pow(1 - t, 4);
+
+function tweenNumbers(root, enter, animate) {
+  cancelAnimationFrame(tweenFrame);
+  const jobs = [...root.querySelectorAll(".pct[data-key]")].map((el) => {
+    const to = Number(el.dataset.to);
+    const key = el.dataset.key;
+    const from = !animate ? to : enter ? 0 : shownPct.get(key) ?? to;
+    const card = el.closest(".card");
+    const delay = enter ? 140 + Number(card.style.getPropertyValue("--i")) * 45 : 0;
+    return { el, key, from, to, delay };
   });
+  const live = new Set(jobs.map((j) => j.key));
+  for (const key of shownPct.keys()) if (!live.has(key)) shownPct.delete(key);
+  for (const j of jobs) {
+    j.el.textContent = `${Math.round(j.from)}%`;
+    shownPct.set(j.key, j.from);
+  }
+  if (jobs.every((j) => j.from === j.to)) return;
+  const start = performance.now();
+  const DURATION = 900;
+  const step = (now) => {
+    let running = false;
+    for (const j of jobs) {
+      const t = Math.min(1, Math.max(0, (now - start - j.delay) / DURATION));
+      const v = j.from + (j.to - j.from) * easeOut(t);
+      j.el.textContent = `${Math.round(v)}%`;
+      shownPct.set(j.key, v);
+      if (t < 1) running = true;
+    }
+    if (running) tweenFrame = requestAnimationFrame(step);
+  };
+  tweenFrame = requestAnimationFrame(step);
+}
+
+// ---- header ----
+
+function headerSub() {
+  const sub = $("header-sub");
+  if (sub.classList.contains("busy")) return;
+  const times = snapshot.filter((a) => !a.hidden && a.updated_ms).map((a) => a.updated_ms);
+  sub.textContent = times.length ? `updated ${agoText(Math.max(...times))}` : "";
+}
+
+// relative times age without new data; update the text only
+function tick() {
+  document.querySelectorAll(".reset[data-ts]").forEach((el) => {
+    el.textContent = resetText(Number(el.dataset.ts) / 1000);
+  });
+  headerSub();
 }
 
 // ---- settings view ----
@@ -198,6 +372,145 @@ function renderSettings() {
 function render() {
   renderAccounts();
   renderSettings();
+  headerSub();
+}
+
+// ---- motion: hover links a row with its ring, light follows the mouse ----
+
+let focused = null; // { card, i }
+
+function setFocus(card, i) {
+  if (focused && focused.card === card && focused.i === i) return;
+  if (focused) {
+    focused.card.querySelectorAll(".row.focus, .rg.focus, .rg.dim").forEach((el) => el.classList.remove("focus", "dim"));
+  }
+  focused = card && i != null ? { card, i } : null;
+  if (!focused) return;
+  card.querySelectorAll(".row").forEach((el) => el.classList.toggle("focus", el.dataset.i === i));
+  card.querySelectorAll(".rg").forEach((el) => {
+    el.classList.toggle("focus", el.dataset.i === i);
+    el.classList.toggle("dim", el.dataset.i !== i);
+  });
+}
+
+$("view-accounts").addEventListener("mouseover", (e) => {
+  const card = e.target.closest(".card");
+  const hit = e.target.closest(".row, .rg");
+  setFocus(card, hit ? hit.dataset.i : null);
+});
+$("view-accounts").addEventListener("mouseleave", () => setFocus(null, null));
+$("view-accounts").addEventListener("mousemove", (e) => {
+  const card = e.target.closest(".card");
+  if (!card) return;
+  const r = card.getBoundingClientRect();
+  card.style.setProperty("--mx", `${e.clientX - r.left}px`);
+  card.style.setProperty("--my", `${e.clientY - r.top}px`);
+});
+
+$("view-accounts").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-hide]");
+  if (!btn) return;
+  const card = btn.closest(".card");
+  card.classList.add("leaving");
+  invoke("set_hidden", { id: btn.dataset.hide, hidden: true }).catch(() => card.classList.remove("leaving"));
+});
+
+// click ripple on every button
+document.addEventListener("pointerdown", (e) => {
+  const btn = e.target.closest(".btn, .icon-btn");
+  if (!btn || btn.disabled || reducedMotion.matches) return;
+  const r = btn.getBoundingClientRect();
+  const dot = document.createElement("span");
+  dot.className = "ripple";
+  dot.style.left = `${e.clientX - r.left}px`;
+  dot.style.top = `${e.clientY - r.top}px`;
+  btn.appendChild(dot);
+  dot.addEventListener("animationend", () => dot.remove());
+});
+
+// ---- popup show / hide ----
+
+let lastEnter = 0;
+
+function enter() {
+  // the Rust event and the focus fallback can both arrive for one show
+  if (popupVisible && performance.now() - lastEnter < 500) return;
+  lastEnter = performance.now();
+  popupVisible = true;
+  lastFit = 0; // the monitor or its scale may have changed since last time
+  const app = $("app");
+  app.classList.remove("away", "entering");
+  void app.offsetWidth;
+  entering = true;
+  app.classList.add("entering");
+  clearTimeout(enterTimer);
+  enterTimer = setTimeout(() => {
+    entering = false;
+    app.classList.remove("entering");
+    app.querySelectorAll(".no-enter").forEach((el) => el.classList.remove("no-enter"));
+  }, 1300);
+  if (!$("view-accounts").hidden) renderAccounts({ enter: true });
+  tick();
+  fitSoon();
+}
+
+function leave() {
+  popupVisible = false;
+  hideTip();
+  setFocus(null, null);
+  $("app").classList.add("away");
+}
+
+listen("popup-visibility", (e) => (e.payload ? enter() : leave()));
+// the page starts hidden (class "away"); if the show event were ever lost,
+// focus still brings it back
+window.addEventListener("focus", () => {
+  if (!popupVisible) enter();
+});
+// shown before this page finished loading: the event above was missed
+invoke("popup_visible").then((shown) => shown && !popupVisible && enter()).catch(() => {});
+
+// ---- window height follows the content ----
+
+let fitTimer = null;
+let lastFit = 0;
+
+function currentView() {
+  return $("view-accounts").hidden ? $("view-settings") : $("view-accounts");
+}
+
+function updateFades(view) {
+  const scrollable = view.scrollHeight > view.clientHeight + 1;
+  view.classList.toggle("fade-bottom", scrollable && view.scrollTop + view.clientHeight < view.scrollHeight - 2);
+  view.classList.toggle("fade-top", scrollable && view.scrollTop > 2);
+}
+
+function fitWindow() {
+  const view = currentView();
+  const height = Math.ceil($("header").offsetHeight + view.scrollHeight + 2); // + app border
+  updateFades(view);
+  if (height === lastFit) return;
+  lastFit = height;
+  invoke("fit_height", { height }).catch(() => (lastFit = 0));
+}
+
+function fitSoon() {
+  clearTimeout(fitTimer);
+  fitTimer = setTimeout(fitWindow, 0);
+}
+
+new MutationObserver(fitSoon).observe($("app"), {
+  childList: true,
+  subtree: true,
+  attributes: true,
+  attributeFilter: ["hidden"],
+});
+document.fonts.ready.then(fitSoon);
+// re-measure after every resize: a scrollbar that came or went changes how
+// text wraps, so the first measurement may be off by a line
+window.addEventListener("resize", fitSoon);
+for (const id of ["view-accounts", "view-settings"]) {
+  $(id).addEventListener("scroll", (e) => updateFades(e.target));
 }
 
 // ---- wiring ----
@@ -209,6 +522,18 @@ function showSettingsView(show) {
   $("brand-settings").hidden = !show;
   $("btn-settings").hidden = show;
   $("btn-refresh").hidden = show;
+  hideTip();
+  const view = currentView();
+  view.classList.remove("slide-left", "slide-right");
+  if (reducedMotion.matches) return;
+  void view.offsetWidth;
+  view.classList.add(show ? "slide-left" : "slide-right");
+}
+
+for (const id of ["view-accounts", "view-settings"]) {
+  $(id).addEventListener("animationend", (e) => {
+    if (e.target === e.currentTarget) e.currentTarget.classList.remove("slide-left", "slide-right");
+  });
 }
 
 $("btn-settings").addEventListener("click", () => {
@@ -235,11 +560,16 @@ $("header").addEventListener("mousemove", (e) => {
 window.addEventListener("mouseup", () => (dragStart = null));
 
 $("btn-refresh").addEventListener("click", async () => {
+  const sub = $("header-sub");
   $("btn-refresh").classList.add("spinning");
+  sub.classList.add("busy");
+  sub.textContent = "refreshing…";
   try {
     await invoke("refresh_now");
   } finally {
     $("btn-refresh").classList.remove("spinning");
+    sub.classList.remove("busy");
+    headerSub();
   }
 });
 
@@ -314,10 +644,7 @@ document.querySelectorAll("[data-copy]").forEach((btn) => {
   });
 });
 
-// refresh relative times every 30s
-setInterval(() => {
-  if (snapshot.length) render();
-}, 30000);
+setInterval(tick, 30000);
 
 function applySnapshot(s) {
   snapshot = s.accounts || [];

@@ -120,6 +120,9 @@ struct AppState {
     refreshing: AtomicBool,
     /// suppresses hide-on-blur while the user drags the window
     dragging: AtomicBool,
+    /// true when the popup was placed below a top taskbar: resizing then
+    /// keeps its top edge instead of the bottom one
+    grows_down: AtomicBool,
     /// unix ms of the last refresh start — popup-open refreshes are
     /// throttled against this
     last_refresh_ms: AtomicU64,
@@ -555,26 +558,93 @@ fn position_window(app: &AppHandle, win: &WebviewWindow) {
     let (x, y) = match rect {
         Some((rx, ry, rw, rh)) => {
             let x = (rx + rw - w).clamp(mx + M, mx + mw - w - M);
-            let y = if ry - my > mh / 2 {
+            let bottom = ry - my > mh / 2;
+            state.grows_down.store(!bottom, Ordering::SeqCst);
+            let y = if bottom {
                 ry - h - M // taskbar at bottom -> popup above it
             } else {
                 ry + rh + M // taskbar at top -> popup below it
             };
             (x, y.clamp(my + M, my + mh - h - M))
         }
-        None => (mx + mw - w - 16, my + mh - h - 72),
+        None => {
+            state.grows_down.store(false, Ordering::SeqCst);
+            (mx + mw - w - 16, my + mh - h - 72)
+        }
     };
     let _ = win.set_position(PhysicalPosition::new(x, y));
+}
+
+/// Resize the popup to the height of its content (logical px, measured by
+/// the page), capped so it always fits on the screen. A visible popup keeps
+/// the edge that faces the taskbar, so it grows away from the tray.
+#[tauri::command]
+fn fit_height(window: WebviewWindow, state: State<AppState>, height: f64) {
+    const MIN_H: f64 = 120.0;
+    const MAX_H: f64 = 680.0;
+    const M: i32 = 8; // margin, same as position_window
+
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let work = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())
+        .map(|m| *m.work_area());
+    let max_h = work
+        .map(|w| w.size.height as f64 / scale - 2.0 * M as f64)
+        .unwrap_or(MAX_H)
+        .clamp(1.0, MAX_H);
+    // a tiny work area wins over the minimum height
+    let target = (height.max(MIN_H.min(max_h)).min(max_h) * scale).round() as u32;
+
+    let Ok(size) = window.outer_size() else { return };
+    if size.height == target {
+        return;
+    }
+    let pos = window.outer_position().ok();
+    let _ = window.set_size(tauri::PhysicalSize::new(size.width, target));
+
+    // a hidden popup is placed by position_window when it is shown
+    if !window.is_visible().unwrap_or(false) {
+        return;
+    }
+    let (Some(pos), Some(work)) = (pos, work) else { return };
+    let top = work.position.y;
+    let bottom = top + work.size.height as i32;
+    let (old_h, new_h) = (size.height as i32, target as i32);
+    let y = if state.grows_down.load(Ordering::SeqCst) {
+        pos.y
+    } else {
+        pos.y + old_h - new_h // keep the bottom edge, grow upwards
+    };
+    let y = y.clamp(top + M, (bottom - new_h - M).max(top + M));
+    let _ = window.set_position(PhysicalPosition::new(pos.x, y));
+}
+
+/// Lets a page that finished loading after the popup was shown (and so
+/// missed the popup-visibility event) catch up.
+#[tauri::command]
+fn popup_visible(window: WebviewWindow) -> bool {
+    window.is_visible().unwrap_or(false)
+}
+
+/// Tells the page the popup was shown or hidden, so it can play its
+/// entrance animation instead of flashing the old frame.
+fn emit_visibility(app: &AppHandle, visible: bool) {
+    let _ = app.emit("popup-visibility", visible);
 }
 
 fn toggle_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         if win.is_visible().unwrap_or(false) {
             let _ = win.hide();
+            emit_visibility(app, false);
         } else {
             position_window(app, &win);
             let _ = win.show();
             let _ = win.set_focus();
+            emit_visibility(app, true);
             // opportunistic refresh on open, throttled so spamming the
             // tray doesn't hammer the APIs
             let state: State<AppState> = app.state();
@@ -602,7 +672,9 @@ fn main() {
             refresh_now,
             add_custom_path,
             remove_custom_path,
-            set_hidden
+            set_hidden,
+            fit_height,
+            popup_visible
         ])
         .setup(|app| {
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -669,11 +741,13 @@ fn main() {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = win.hide();
+                emit_visibility(win.app_handle(), false);
             }
             tauri::WindowEvent::Focused(false) => {
                 let state: State<AppState> = win.app_handle().state();
                 if !state.dragging.load(Ordering::SeqCst) {
                     let _ = win.hide();
+                    emit_visibility(win.app_handle(), false);
                 }
             }
             tauri::WindowEvent::Focused(true) => {
