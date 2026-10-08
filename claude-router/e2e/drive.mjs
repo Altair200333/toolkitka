@@ -1,6 +1,7 @@
 // End-to-end runs of the router against examples/fake_claude.exe: no quota is spent.
 // Usage: node e2e/drive.mjs [scenario ...]   (cargo build --release --example fake_claude first)
 // Each scenario gets its own folder under %TEMP%\rfake\<name> with a copy of the router.
+// STRATEGY=1 runs them with "strategy": "fable_spread" (folders under %TEMP%\rfake-s).
 import { spawn, execFileSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
@@ -208,7 +209,7 @@ function patch(dir, acct, change) {
 }
 
 function setup(name, sc) {
-  const dir = path.join(os.tmpdir(), "rfake", name);
+  const dir = path.join(os.tmpdir(), process.env.STRATEGY ? "rfake-s" : "rfake", name);
   fs.rmSync(dir, { recursive: true, force: true });
   for (const d of ["bin", "acc-a", "acc-b", "work"]) fs.mkdirSync(path.join(dir, d), { recursive: true });
   fs.copyFileSync(ROUTER, path.join(dir, "bin", "claude.exe"));
@@ -216,6 +217,7 @@ function setup(name, sc) {
     claude_exe: FAKE,
     usage_json: path.join(dir, "uz", "usage.json"),
     fresh_minutes: 5,
+    ...(process.env.STRATEGY ? { strategy: "fable_spread" } : {}),
     accounts: [
       { name: "a", config_dir: path.join(dir, "acc-a") },
       { name: "b", config_dir: path.join(dir, "acc-b") },

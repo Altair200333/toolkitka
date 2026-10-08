@@ -12,10 +12,16 @@
 //! named claude.exe there: a `claude` started from inside a chat comes back through the router.
 //!
 //! Files next to the exe: `router.json` (config) and `state/` (log, live quota, usage answers,
-//! session map, interrupted background tasks, test switches `force-account.txt` and
+//! session map, live threads, interrupted background tasks, test switches `force-account.txt` and
 //! `switch-after-turn`, backups of overwritten copies).
+//!
+//! With `"strategy": "fable_spread"` in router.json the account is chosen by `strategy`;
+//! the list of live threads and what they spend is kept either way.
+
+mod strategy;
 
 use serde_json::{json, Value};
+use strategy::{Acc, Burn, Kind, Plan, Thread, Turn, World};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -72,12 +78,20 @@ const UZALKA_TIMEOUT: Duration = Duration::from_secs(15);
 /// `CLAUDE_CONFIG_DIR` still equals it inherited the account; a different one was chosen by the caller.
 const MARK_VAR: &str = "CLAUDE_ROUTER_CONFIG_DIR";
 const CREDENTIAL_VARS: [&str; 3] = ["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+/// $ of limit cost per 1% of the 5-hour window, the week and the Fable week (measured on recorded threads).
+const DOLLARS_PER_PERCENT: [f64; 3] = [1.75, 11.2, 4.2];
+/// A running thread writes what it spent to the list of live threads at most this often.
+const SAVE_EVERY_MS: u64 = 15_000;
+/// A message id is remembered this long after its last block, so its repeated usage is not counted twice.
+const COUNTED_MS: u64 = 10 * 60_000;
 
 struct Account {
     name: String,
     config_dir: PathBuf,
     only_paths: Vec<String>,
     exclude_paths: Vec<String>,
+    /// $ of limit cost in a whole 5-hour window, week and Fable week (`dollars_per_percent` in router.json).
+    cap: [f64; 3],
 }
 
 struct Config {
@@ -96,6 +110,11 @@ struct Config {
     /// The account T3's status check shows (email, plan); `None`: chosen like any start.
     face_account: Option<usize>,
     route_nested: bool,
+    /// "fable_spread" in router.json: accounts are chosen by `strategy`; otherwise by `choose`.
+    strategy: bool,
+    /// A new claude -p run that no account admits waits at most this long, then fails. 0 (default): it
+    /// fails at once with the time it would start (its caller's Bash tool would end a long wait anyway).
+    cli_max_wait_ms: u64,
     accounts: Vec<Account>,
 }
 
@@ -152,6 +171,8 @@ struct Move {
     target_has_quota: bool,
     /// Something the model should tell the user (an account that needs /login).
     notice: Option<String>,
+    /// No account has room now: T3 may resume the thread then (the first account frees up before this one).
+    resume_at_ms: Option<u64>,
 }
 
 /// How fresh the usage data must be for a decision.
@@ -218,11 +239,14 @@ fn load_config(path: &Path) -> Result<Config, String> {
     let list = |a: &Value| a.as_array().map(|x| x.iter().filter_map(|p| p.as_str().map(norm_path)).collect()).unwrap_or_default();
     let mut accounts = Vec::new();
     for a in v["accounts"].as_array().ok_or("accounts is missing in router.json")? {
+        let k: Vec<f64> = a["dollars_per_percent"].as_array().map(|x| x.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+        let k = if k.len() == 3 { [k[0], k[1], k[2]] } else { DOLLARS_PER_PERCENT };
         accounts.push(Account {
             name: a["name"].as_str().ok_or("account without name")?.to_string(),
             config_dir: PathBuf::from(expand_env(a["config_dir"].as_str().ok_or("account without config_dir")?)),
             only_paths: list(&a["only_paths"]),
             exclude_paths: list(&a["exclude_paths"]),
+            cap: k.map(|x| x * 100.0),
         });
     }
     if accounts.is_empty() {
@@ -243,6 +267,8 @@ fn load_config(path: &Path) -> Result<Config, String> {
         leave_with_tasks_below_percent: v["leave_with_tasks_below_percent"].as_f64().unwrap_or(2.0),
         face_account,
         route_nested: v["route_nested"].as_bool().unwrap_or(true),
+        strategy: v["strategy"].as_str() == Some("fable_spread"),
+        cli_max_wait_ms: (v["cli_max_wait_minutes"].as_f64().unwrap_or(0.0) * 60_000.0) as u64,
         accounts,
     })
 }
@@ -428,7 +454,9 @@ fn read_json(path: &Path) -> Option<Value> {
 }
 
 fn write_json(path: &Path, v: &Value) {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    // Its own temporary file per write: two threads of one router may write the same file.
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!("tmp{}-{}", std::process::id(), WRITES.fetch_add(1, Ordering::Relaxed)));
     if fs::write(&tmp, serde_json::to_string_pretty(v).unwrap_or_default()).is_err() {
         return;
     }
@@ -442,30 +470,38 @@ fn write_json(path: &Path, v: &Value) {
     let _ = fs::remove_file(&tmp);
 }
 
-/// Read-modify-write of `live/<account>.json` under a short lock: every router on an account
-/// reports its events there, several at a time when agents run.
-fn update_live(state: &Path, account: &Account, change: impl FnOnce(&mut Value)) {
-    let path = live_path(state, account);
-    let lock = path.with_extension("lock");
+/// Runs `f` holding a short lock file. A lock older than 10 s was left by a router that died; after
+/// 2 s of waiting `f` runs anyway.
+fn locked<T>(lock: &Path, f: impl FnOnce() -> T) -> T {
     let deadline = Instant::now() + Duration::from_secs(2);
-    let mut locked = false;
+    let mut taken = false;
     while Instant::now() < deadline {
-        if fs::OpenOptions::new().write(true).create_new(true).open(&lock).is_ok() {
-            locked = true;
+        if fs::OpenOptions::new().write(true).create_new(true).open(lock).is_ok() {
+            taken = true;
             break;
         }
-        if fs::metadata(&lock).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(10)) {
-            let _ = fs::remove_file(&lock);
+        if fs::metadata(lock).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(10)) {
+            let _ = fs::remove_file(lock);
             continue;
         }
         std::thread::sleep(Duration::from_millis(15));
     }
-    let mut live = read_json(&path).unwrap_or_else(|| json!({}));
-    change(&mut live);
-    write_json(&path, &live);
-    if locked {
-        let _ = fs::remove_file(&lock);
+    let out = f();
+    if taken {
+        let _ = fs::remove_file(lock);
     }
+    out
+}
+
+/// Read-modify-write of `live/<account>.json` under a short lock: every router on an account
+/// reports its events there, several at a time when agents run.
+fn update_live(state: &Path, account: &Account, change: impl FnOnce(&mut Value)) {
+    let path = live_path(state, account);
+    locked(&path.with_extension("lock"), || {
+        let mut live = read_json(&path).unwrap_or_else(|| json!({}));
+        change(&mut live);
+        write_json(&path, &live);
+    });
 }
 
 fn live_path(state: &Path, account: &Account) -> PathBuf {
@@ -507,11 +543,9 @@ fn lifted(windows: &[Window], scope: Option<&str>, now: u64) -> bool {
     !relevant.is_empty() && relevant.iter().all(|w| w.used < 100.0 || w.resets_ms.is_some_and(|r| r <= now))
 }
 
-/// Share of quota left for these models on this account, newest data wins.
-fn score(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, account: &Account, models: &[String], now: u64) -> Score {
-    if login_dead(account) {
-        return Err(format!("auth failure: signed out, needs /login with CLAUDE_CONFIG_DIR={}", account.config_dir.display()));
-    }
+/// The account's live events (`live/<account>.json`), when they were last written, whether that is recent
+/// enough to go by, and its newest full reading if that is recent enough.
+fn readings(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, account: &Account, now: u64) -> (Option<Value>, u64, bool, Result<(u64, Reading), String>) {
     let live = read_json(&live_path(state, account));
     let max_age_ms = cfg.max_snapshot_age_minutes * 60_000.0;
     let live_updated = live.as_ref().and_then(|l| l["updated_ms"].as_u64()).unwrap_or(0);
@@ -522,6 +556,33 @@ fn score(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, account: 
         }
         Ok((updated, r))
     });
+    (live, live_updated, live_fresh, reading)
+}
+
+/// The newest windows: the full reading with the windows of later live events on top, or the live
+/// events alone while they are recent enough.
+fn merge_windows(reading: Result<(u64, Reading), String>, live: Option<&Value>, live_updated: u64, live_fresh: bool) -> Result<Vec<Window>, String> {
+    match (reading, live) {
+        (Ok((_, Reading::SignedOut(e))), _) => Err(format!("auth failure: {e}")),
+        (Ok((updated, Reading::Windows(mut windows))), Some(live)) if live_updated > updated => {
+            for lw in live_windows(live) {
+                windows.retain(|w| !(w.kind == lw.kind && w.scope == lw.scope));
+                windows.push(lw);
+            }
+            Ok(windows)
+        }
+        (Ok((_, Reading::Windows(windows))), _) => Ok(windows),
+        (Err(_), Some(live)) if live_fresh => Ok(live_windows(live)),
+        (Err(e), _) => Err(e),
+    }
+}
+
+/// Share of quota left for these models on this account, newest data wins.
+fn score(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, account: &Account, models: &[String], now: u64) -> Score {
+    if login_dead(account) {
+        return Err(format!("auth failure: signed out, needs /login with CLAUDE_CONFIG_DIR={}", account.config_dir.display()));
+    }
+    let (live, live_updated, live_fresh, reading) = readings(cfg, state, snapshot, account, now);
     if let Some(l) = &live {
         let (read_at, read_windows): (u64, &[Window]) = match &reading {
             Ok((t, Reading::Windows(w))) => (*t, w),
@@ -548,22 +609,47 @@ fn score(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, account: 
             return Err(format!("auth failure in a chat {} min ago ({})", (now - failed) / 60_000, l["auth_error"].as_str().unwrap_or("?")));
         }
     }
-    let windows = match (reading, live) {
-        (Ok((_, Reading::SignedOut(e))), _) => return Err(format!("auth failure: {e}")),
-        (Ok((updated, Reading::Windows(mut windows))), Some(live)) if live_updated > updated => {
-            for lw in live_windows(&live) {
-                windows.retain(|w| !(w.kind == lw.kind && w.scope == lw.scope));
-                windows.push(lw);
-            }
-            windows
-        }
-        (Ok((_, Reading::Windows(windows))), _) => windows,
-        (Err(_), Some(live)) if live_fresh => live_windows(&live),
-        (Err(e), _) => return Err(e),
-    };
+    let windows = merge_windows(reading, live.as_ref(), live_updated, live_fresh)?;
     let (left, detail) = remaining(&windows, models, now).ok_or("no quota windows for this model")?;
     let scoped = windows.iter().filter_map(|w| w.scope.clone()).filter(|s| !s.is_empty()).collect();
     Ok(Quota { left, weekly_reset_ms: next_weekly_reset(&windows, now), scoped, detail })
+}
+
+/// An account as the strategy sees it: use and end of its 5-hour, weekly and Fable
+/// windows. A refusal that stands counts as its window full until the reset the API named.
+fn account_view(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, account: &Account, now: u64) -> Acc {
+    let mut v = Acc { cap: account.cap, ..Acc::default() };
+    let whole = score(cfg, state, snapshot, account, &[], now);
+    v.dead = matches!(&whole, Err(e) if e.contains("auth failure"));
+    let (live, live_updated, live_fresh, reading) = readings(cfg, state, snapshot, account, now);
+    let windows = merge_windows(reading, live.as_ref(), live_updated, live_fresh).unwrap_or_default();
+    // A window that has reset is empty (and a 5-hour one is not open) until the next request.
+    for w in windows.iter().filter(|w| !w.resets_ms.is_some_and(|r| r <= now)) {
+        match (w.kind.as_str(), w.scope.as_deref()) {
+            // A window in use with no reset named ends within 5 h: taken as the latest.
+            ("session", None) => (v.u5, v.w5_end) = (w.used, w.resets_ms.or((w.used > 0.0).then_some(now + 5 * 3_600_000))),
+            ("weekly_all", None) => v.u7 = w.used,
+            ("weekly_scoped", Some("fable")) => v.uf = w.used,
+            _ => {}
+        }
+    }
+    v.w7_end = next_weekly_reset(&windows, now);
+    v.unknown = !windows.iter().any(|w| w.scope.is_none() && (w.kind == "session" || w.kind == "weekly_all"));
+    let live = live.unwrap_or(Value::Null);
+    if rejected(&whole) {
+        let until = live["rejected_until_ms"].as_u64().filter(|&u| u > now);
+        if live["rejected_until_type"] == "seven_day" {
+            v.u7 = 100.0;
+            v.w7_end = until.or(v.w7_end);
+        } else {
+            v.u5 = 100.0;
+            v.w5_end = until.or(v.w5_end);
+        }
+        v.unknown = false;
+    } else if rejected(&score(cfg, state, snapshot, account, &["fable".to_string()], now)) {
+        v.uf = 100.0;
+    }
+    v
 }
 
 /// An account that will certainly fail: the API refused it, or it is signed out.
@@ -1031,6 +1117,7 @@ fn on_rate_limit(line: &[u8], account: &Account, state: &Path, log: &Log, overag
                 }
                 None => {
                     live["rejected_until_ms"] = json!(until);
+                    live["rejected_until_type"] = json!(kind);
                     live["rejected_ms"] = json!(now);
                 }
             }
@@ -1267,11 +1354,12 @@ struct Launch<'a> {
     session: Option<String>,
     overage_scope: Option<String>,
     recheck: Option<Arc<Recheck>>,
+    tracker: Arc<Tracker>,
 }
 
 /// Runs claude.exe, passing stdin and stdout through. Returns the exit code for T3.
 fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
-    let Launch { cfg, args, state, log, home, session, overage_scope, recheck } = launch;
+    let Launch { cfg, args, state, log, home, session, overage_scope, recheck, tracker } = launch;
     let mut cmd = Command::new(&cfg.claude_exe);
     cmd.args(&args)
         .env("CLAUDE_CONFIG_DIR", &account.config_dir)
@@ -1383,6 +1471,7 @@ fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
         if let Some((goes_on, own, sent)) = read {
             // Only now, with the result in T3's hands, is the turn over for the router too.
             seen.lock().unwrap().result_out(goes_on, own, sent);
+            tracker.save();
             let Some((Some((first, by_flag)), _)) = decision else { continue };
             let Some(recheck) = &recheck else { continue };
             after_turn(LeaveCtx {
@@ -1396,6 +1485,7 @@ fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
                 log: log.clone(),
                 recheck: Arc::clone(recheck),
                 interrupted: interrupted.clone(),
+                tracker: Arc::clone(&tracker),
             });
         } else if line.starts_with(b"{\"type\":\"assistant\"") {
             let main_thread = contains(&line, b"\"parent_tool_use_id\":null");
@@ -1420,6 +1510,11 @@ fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
             }
             drop(s);
             on_account_error(&line, account, &state, &log);
+            if contains(&line, b"\"usage\"") {
+                if let Ok(v) = serde_json::from_slice::<Value>(&line) {
+                    tracker.on_message(&v);
+                }
+            }
         } else if line.starts_with(b"{\"type\":\"stream_event\"") {
             // The first sign of a turn while the model still thinks (T3 asks for partial messages).
             if contains(&line, b"\"message_start\"") && serde_json::from_slice::<Value>(&line).is_ok_and(|v| v["parent_tool_use_id"].is_null() && v["event"]["type"] == "message_start") {
@@ -1427,6 +1522,13 @@ fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
             }
         } else if contains(&line, b"\"rate_limit_event\"") {
             if let Some(kind) = on_rate_limit(&line, account, &state, &log, overage_scope.as_deref()) {
+                let scope = match kind.as_str() {
+                    "seven_day_overage_included" => Some(overage_scope.as_deref().unwrap_or("fable")),
+                    k => k.strip_prefix("seven_day_"),
+                };
+                if scope.is_some_and(|s| s.eq_ignore_ascii_case("fable")) {
+                    tracker.on_fable_refused();
+                }
                 let mut s = seen.lock().unwrap();
                 if !s.refused.contains(&kind) {
                     s.refused.push(kind);
@@ -1485,7 +1587,7 @@ fn decide_after_turn(
     let flag = state.join("switch-after-turn");
     if flag.exists() {
         let _ = fs::remove_file(&flag);
-        return (Some((Move { reason: "switch-after-turn flag".into(), kind: Leave::Soft, target_has_quota: true, notice: None }, true)), None);
+        return (Some((Move { reason: "switch-after-turn flag".into(), kind: Leave::Soft, target_has_quota: true, notice: None, resume_at_ms: None }, true)), None);
     }
     // T3 resumes only a failed turn; a successful one (agents refused, the thread went on) is
     // done whatever events came before its result.
@@ -1497,16 +1599,21 @@ fn decide_after_turn(
     let whole_account = refused.iter().any(|k| matches!(k.as_str(), "five_hour" | "seven_day" | "unknown"));
     let data = if end.failed && (limit_error || whole_account) && !promise_open { Data::Newest } else { Data::AsIs };
     let Some(mut m) = recheck(&models, data) else { return (None, None) };
-    if !(limited && m.target_has_quota && (m.kind == Leave::Blocked || limit_error)) {
+    if !(limited && (m.target_has_quota || m.resume_at_ms.is_some()) && (m.kind == Leave::Blocked || limit_error)) {
         return (Some((m, false)), None);
     }
-    let at_ms = now_ms() + RESUME_AFTER_S * 1000;
+    let soon = now_ms() + RESUME_AFTER_S * 1000;
+    let at_ms = if m.target_has_quota { soon } else { m.resume_at_ms.unwrap_or(soon).max(soon) };
     let id = v["session_id"].as_str().or(session).unwrap_or("");
     let kinds = if refused.is_empty() { vec!["five_hour".to_string()] } else { refused };
     let events: Vec<u8> = kinds.iter().flat_map(|k| refusal_event(id, k, at_ms / 1000)).collect();
-    // T3 keeps the latest time it was told: the router leaves by the latest promise.
-    seen.lock().unwrap().promised_ms = Some(at_ms);
-    log.write(json!({"event": "refusal_reported", "account": account.name, "reason": m.reason, "kinds": kinds, "in_s": RESUME_AFTER_S}));
+    // T3 keeps the latest time it was told: the router leaves by the latest promise. A promise far
+    // ahead (no account has room until then) is not waited for: the router leaves as after any
+    // refusal and T3 resumes the thread then.
+    if at_ms == soon {
+        seen.lock().unwrap().promised_ms = Some(at_ms);
+    }
+    log.write(json!({"event": "refusal_reported", "account": account.name, "reason": m.reason, "kinds": kinds, "in_s": (at_ms - soon) / 1000 + RESUME_AFTER_S}));
     m.kind = Leave::Blocked;
     (Some((m, false)), Some(events))
 }
@@ -1523,6 +1630,7 @@ struct LeaveCtx {
     log: Log,
     recheck: Arc<Recheck>,
     interrupted: Option<PathBuf>,
+    tracker: Arc<Tracker>,
 }
 
 /// The next turn should run elsewhere. Unless the account is refused or its login is dead, wait
@@ -1539,7 +1647,7 @@ struct LeaveCtx {
 fn after_turn(ctx: LeaveCtx) {
     let messages_before = ctx.user_messages.load(Ordering::SeqCst);
     std::thread::spawn(move || {
-        let LeaveCtx { first: mut m, by_flag, account, child_stdin, child_pid, user_messages, seen, log, recheck, interrupted } = ctx;
+        let LeaveCtx { first: mut m, by_flag, account, child_stdin, child_pid, user_messages, seen, log, recheck, interrupted, tracker } = ctx;
         let busy = || !seen.lock().unwrap().tasks.is_empty();
         let promise = || seen.lock().unwrap().promised_ms.filter(|&t| t > now_ms());
         let ms = |d: Duration| d.as_millis() as u64;
@@ -1633,6 +1741,7 @@ fn after_turn(ctx: LeaveCtx) {
             // The job object takes claude and its agents with the router.
             log.write(json!({"event": "claude_did_not_exit", "account": account, "tasks": tasks}));
         }
+        tracker.finish();
         std::process::exit(0);
     });
 }
@@ -1691,7 +1800,234 @@ fn read_session(state: &Path, id: &str, now: u64) -> (Option<String>, Vec<(Strin
 
 fn write_session(state: &Path, id: &str, account: &str, models: &[(String, u64)]) {
     let models: serde_json::Map<String, Value> = models.iter().map(|(m, t)| (m.clone(), json!(t))).collect();
-    write_json(&state.join("sessions").join(format!("{id}.json")), &json!({"account": account, "models": models}));
+    update_session(state, id, |v| {
+        v["account"] = json!(account);
+        v["models"] = Value::Object(models);
+    });
+}
+
+/// Read-modify-write of `sessions/<id>.json`: the account and models, and for the strategy what the
+/// thread spent (`burn`), where it was put (`home`) and when it last moved (`last_move_ms`).
+fn update_session(state: &Path, id: &str, change: impl FnOnce(&mut Value)) {
+    let path = state.join("sessions").join(format!("{id}.json"));
+    let mut v = match read_json(&path).filter(Value::is_object) {
+        Some(v) => v,
+        // Being replaced right now: a second look; still unreadable, it is left as it is rather than
+        // lose the account and models in it, unless it has been broken for a while.
+        None if path.exists() => {
+            std::thread::sleep(Duration::from_millis(50));
+            match read_json(&path).filter(Value::is_object) {
+                Some(v) => v,
+                None if fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(10)) => json!({}),
+                None => return,
+            }
+        }
+        None => json!({}),
+    };
+    change(&mut v);
+    write_json(&path, &v);
+}
+
+/// The list of live threads: `state/threads/<router pid>-<its start ms>.json` for every router
+/// that runs a thread. Written when its account is chosen, so starts seconds apart see each other,
+/// and as it spends; removed when it exits. Readers delete the files of routers that are gone
+/// (killed, or the PC was switched off): their pid is not running, or belongs to a process that
+/// started at another time.
+fn threads_dir(state: &Path) -> PathBuf {
+    state.join("threads")
+}
+
+/// When this process started (unix ms), if it is running.
+#[cfg(windows)]
+fn process_started_ms(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    const STILL_ACTIVE: u32 = 259;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        let mut code = 0u32;
+        let running = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE && GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        CloseHandle(h);
+        // FILETIME counts 100 ns from 1601.
+        let t = (((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64) / 10_000;
+        running.then(|| t.saturating_sub(11_644_473_600_000))
+    }
+}
+
+#[cfg(not(windows))]
+fn process_started_ms(pid: u32) -> Option<u64> {
+    Path::new(&format!("/proc/{pid}")).exists().then_some(0)
+}
+
+/// The other threads live now (a call or a start within LIVE_MS, or a start held for later), as the
+/// strategy sees them. The files of routers that are gone are deleted on the way.
+fn live_threads(cfg: &Config, state: &Path, now: u64, own_session: Option<&str>) -> Vec<Thread> {
+    let me = std::process::id();
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(threads_dir(state)) else { return out };
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().is_none_or(|x| x != "json") {
+            // A write cut short (write_json's temporary file) or the choice lock.
+            if path.extension().is_some_and(|x| x.to_string_lossy().starts_with("tmp")) && fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(600)) {
+                let _ = fs::remove_file(&path);
+            }
+            continue;
+        }
+        // Being replaced right now: skipped this time.
+        let Some(v) = read_json(&path) else { continue };
+        let pid = v["pid"].as_u64().unwrap_or(0) as u32;
+        if !process_started_ms(pid).is_some_and(|t| t.abs_diff(v["started_ms"].as_u64().unwrap_or(0)) < 2000) {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        if pid == me || own_session.is_some_and(|s| v["session"].as_str() == Some(s)) {
+            continue;
+        }
+        let index = |k: &Value| k.as_str().and_then(|n| cfg.accounts.iter().position(|a| a.name == n));
+        let w = &v["waiting"];
+        let waiting = index(&w["account"]).map(|a| (a, w["at_ms"].as_u64().unwrap_or(now), w["b"].as_f64().unwrap_or(strategy::B0_NEW)));
+        let burn = Burn::from_json(&v["burn"]);
+        if waiting.is_none() && now.saturating_sub(burn.last_ms.max(v["booked_ms"].as_u64().unwrap_or(0))) > strategy::LIVE_MS {
+            continue;
+        }
+        // A held start books itself again at every look (RECHECK_MS at most); one that stopped looking (its
+        // process is stuck or suspended) no longer holds a place.
+        if waiting.is_some() && now.saturating_sub(v["updated_ms"].as_u64().unwrap_or(0)) > strategy::RECHECK_MS + 10 * 60_000 {
+            continue;
+        }
+        let mut t = Thread::new(Kind::parse(v["kind"].as_str().unwrap_or("")), burn, v["fable"] == true);
+        t.account = index(&v["account"]);
+        t.waiting = waiting;
+        out.push(t);
+    }
+    out
+}
+
+/// This router's thread in the list of live threads, and what it spends: the usage of every API call
+/// in claude's output, priced as the limits count it (`strategy::call_cost`).
+struct Tracker {
+    path: PathBuf,
+    state: PathBuf,
+    /// The kept session: what the thread spent goes there too, for its next process.
+    session: Option<String>,
+    inner: Mutex<Tracked>,
+}
+
+struct Tracked {
+    record: Value,
+    burn: Burn,
+    fable: bool,
+    /// Messages counted lately, with their cost and when last seen: claude writes a message once per
+    /// content block, its usage repeated.
+    counted: Vec<(String, f64, u64)>,
+    saved_ms: u64,
+    booked: bool,
+}
+
+impl Tracker {
+    fn new(state: &Path, session: Option<String>, kind: Kind, cwd: &str, burn: Burn, fable: bool) -> Tracker {
+        let pid = std::process::id();
+        let started = process_started_ms(pid).unwrap_or(0);
+        let record = json!({"pid": pid, "started_ms": started, "session": session, "kind": kind.name(), "cwd": cwd,
+            "account": null, "booked_ms": 0, "waiting": null});
+        let _ = fs::create_dir_all(threads_dir(state));
+        Tracker {
+            // The start time in the name: a reader deleting the file of a router that is gone never hits the
+            // file of a new router that got the same pid.
+            path: threads_dir(state).join(format!("{pid}-{started}.json")),
+            state: state.to_path_buf(),
+            session,
+            inner: Mutex::new(Tracked { record, burn, fable, counted: Vec::new(), saved_ms: 0, booked: false }),
+        }
+    }
+
+    /// Puts the thread on an account in the list; a held start is promised there at `at_ms`, with
+    /// this burn counted for it.
+    fn book(&self, account: &str, waiting: Option<(u64, f64)>) {
+        let mut t = self.inner.lock().unwrap();
+        t.record["account"] = json!(account);
+        t.record["booked_ms"] = json!(now_ms());
+        t.record["waiting"] = waiting.map_or(Value::Null, |(at, b)| json!({"account": account, "at_ms": at, "b": b}));
+        t.booked = true;
+        self.write(&mut t, false);
+    }
+
+    fn write(&self, t: &mut Tracked, session_too: bool) {
+        t.saved_ms = now_ms();
+        t.record["updated_ms"] = json!(t.saved_ms);
+        t.record["fable"] = json!(t.fable);
+        t.record["burn"] = t.burn.to_json();
+        if t.booked {
+            write_json(&self.path, &t.record);
+        }
+        if let (true, Some(id)) = (session_too, &self.session) {
+            let burn = t.burn.to_json();
+            update_session(&self.state, id, |v| v["burn"] = burn);
+        }
+    }
+
+    /// An assistant message of the main thread or an agent.
+    fn on_message(&self, v: &Value) {
+        let m = &v["message"];
+        let (Some(model), Some(id)) = (m["model"].as_str(), m["id"].as_str()) else { return };
+        if model.starts_with('<') || !m["usage"].is_object() {
+            return;
+        }
+        let cost = strategy::call_cost(model, &m["usage"]);
+        let fable = model.to_lowercase().contains("fable");
+        let now = now_ms();
+        let mut t = self.inner.lock().unwrap();
+        // A message's blocks come within its response; many agents may answer in between.
+        t.counted.retain(|c| now.saturating_sub(c.2) < COUNTED_MS);
+        let before = t.counted.iter().position(|c| c.0 == id);
+        let added = (cost - before.map_or(0.0, |i| t.counted[i].1)).max(0.0);
+        match before {
+            Some(i) => {
+                t.counted[i].1 = t.counted[i].1.max(cost);
+                t.counted[i].2 = now;
+            }
+            None => t.counted.push((id.to_string(), cost, now)),
+        }
+        if before.is_none() || added > 0.0 {
+            t.burn.add(now, added, fable);
+        }
+        t.fable |= fable;
+        if now.saturating_sub(t.saved_ms) >= SAVE_EVERY_MS {
+            self.write(&mut t, true);
+        }
+    }
+
+    fn on_fable_refused(&self) {
+        let mut t = self.inner.lock().unwrap();
+        t.burn.fable_refused_ms = now_ms();
+        self.write(&mut t, true);
+    }
+
+    fn save(&self) {
+        let mut t = self.inner.lock().unwrap();
+        self.write(&mut t, true);
+    }
+
+    fn snapshot(&self) -> (Burn, bool) {
+        let t = self.inner.lock().unwrap();
+        (t.burn.clone(), t.fable)
+    }
+
+    /// The router exits: what the thread spent stays with its session, it leaves the list.
+    fn finish(&self) {
+        let mut t = self.inner.lock().unwrap();
+        if !t.booked {
+            return;
+        }
+        self.write(&mut t, true);
+        t.booked = false;
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 fn read_snapshot(cfg: &Config) -> Result<Value, String> {
@@ -1702,6 +2038,110 @@ fn read_snapshot(cfg: &Config) -> Result<Value, String> {
 
 fn read_forced(state: &Path) -> Option<String> {
     fs::read_to_string(state.join("force-account.txt")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Every account (by index) and the other live threads, as the strategy sees them now.
+fn strategy_world(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, now: u64, session: Option<&str>) -> (Vec<Acc>, Vec<Thread>) {
+    let accs = cfg.accounts.iter().map(|a| account_view(cfg, state, snapshot, a, now)).collect();
+    (accs, live_threads(cfg, state, now, session))
+}
+
+fn rows_json(cfg: &Config, rows: &[strategy::Row]) -> Value {
+    json!(rows.iter().map(|r| r.to_json(&cfg.accounts[r.acc].name)).collect::<Vec<_>>())
+}
+
+/// The strategy's account for a starting process.
+enum Start {
+    Run(usize, String),
+    /// A new claude -p run no account admits now: it waits for the plan.
+    Hold(Plan, String),
+}
+
+/// The strategy's choice when a process starts: a new T3 chat is placed; a T3 chat
+/// that comes back (its process had ended) is judged as at a turn boundary, after its idle time; a
+/// claude -p run goes through admission. None: no account can be judged, the default rules decide.
+fn strategy_start(cfg: &Config, world: &World, me: &Thread, idle_ms: u64) -> Option<(Start, Value)> {
+    let now = world.now;
+    let name = |a: usize| cfg.accounts[a].name.clone();
+    if me.kind == Kind::Cli {
+        let (plan, rows) = world.plan(me)?;
+        let in_h = |t: u64| (t.saturating_sub(now) as f64 / 3_600_000.0 * 10.0).round() / 10.0;
+        let log = json!({"rule": "admission", "rows": rows_json(cfg, &rows), "plan": {"account": name(plan.acc), "in_h": in_h(plan.at), "admitted": plan.admitted}});
+        if plan.admitted && plan.at <= now {
+            return Some((Start::Run(plan.acc, "claude -p admitted: the 5-hour window carries it with the threads there".into()), log));
+        }
+        let why = if plan.admitted {
+            format!("no 5-hour window carries this claude -p now; {} admits it in {} h", name(plan.acc), in_h(plan.at))
+        } else {
+            format!("no account admits this claude -p within 3 windows; the least loaded is {} in {} h", name(plan.acc), in_h(plan.at))
+        };
+        return Some((Start::Hold(plan, why), log));
+    }
+    if let Some(a) = me.account {
+        let rows = world.rows(me, me.bhat(now, world.accs[a].cap[0]), strategy::R_STAY, None);
+        let log = json!({"rule": "turn", "idle_min": idle_ms / 60_000, "rows": rows_json(cfg, &rows)});
+        return Some(match world.at_turn(me, idle_ms) {
+            Turn::Move { to, why, .. } => (Start::Run(to, format!("moves from {}: {why}", name(a))), log),
+            Turn::Stay(why) => (Start::Run(a, format!("stays on the session's account: {why}")), log),
+        });
+    }
+    let (a, why, rows) = world.place(me)?;
+    Some((Start::Run(a, format!("new thread: {why}")), json!({"rule": "place", "rows": rows_json(cfg, &rows)})))
+}
+
+/// After a turn, by the strategy: leave only when the account is about to run out; a
+/// cold move waits for the next start. An account that cannot serve is left in any case, as by the
+/// default rules; when no account has room, T3 may resume the thread when the first one frees up.
+#[allow(clippy::too_many_arguments)]
+fn strategy_recheck(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, allowed: &[usize], current: usize, tracker: &Tracker, models: &[String], own_models: &[String], session: Option<&str>, now: u64) -> Option<Move> {
+    let (accs, others) = strategy_world(cfg, state, snapshot, now, session);
+    let world = World { accs: &accs, allowed, others: &others, now };
+    let (burn, fable) = tracker.snapshot();
+    let mut me = Thread::new(Kind::T3, burn, fable || models.iter().any(|m| m.to_lowercase().contains("fable")));
+    me.account = Some(current);
+    me.home = Some(current);
+    let here = &cfg.accounts[current];
+    let own = score(cfg, state, snapshot, here, own_models, now);
+    let notice = login_notice(here);
+    // The thread starts again RESUME_AFTER_S later at the soonest and is judged anew then: at_turn leaves its
+    // account only if that frees up more than 20 min later. A refused account that frees up sooner is waited
+    // for, whatever is decided now, and another account freeing up helps only before that.
+    let own_at = world.t_usable(current, &me);
+    let (soon, guard) = (now + RESUME_AFTER_S * 1000, 20 * 60_000);
+    let wait_own = blocked(&own) && own_at > now && own_at <= soon + guard;
+    match world.at_turn(&me, 0) {
+        Turn::Move { to, low, why, .. } if !wait_own => {
+            // Low: under 5% of what the thread needs, it goes even while background tasks run. Fable short
+            // alone does not end the background agents of a thread whose own model is not Fable.
+            let v = &accs[current];
+            let own_fable = own_models.iter().any(|m| m.to_lowercase().contains("fable"));
+            let low = low && (own_fable || v.dead || (100.0 - v.u5).min(100.0 - v.u7) < strategy::R_STAY);
+            let kind = match leave_kind(cfg, &own) {
+                Leave::Soft if low && !blocked(&own) => Leave::Low,
+                k => k,
+            };
+            Some(Move { reason: format!("next turn goes to {}: {why}", cfg.accounts[to].name), kind, target_has_quota: true, notice, resume_at_ms: None })
+        }
+        Turn::Stay(why) | Turn::Move { why, .. } if blocked(&own) => {
+            // T3 resumes the thread when an account it would go to frees up, not every 90 s onto the same
+            // refusal. A refusal the data does not show (own_at not ahead) gets no time from here.
+            let first = world
+                .first_usable(&me)
+                .filter(|&(a, t)| a != current && t.max(soon) + guard < own_at)
+                .or_else(|| wait_own.then_some((current, own_at)));
+            let then = first.map(|(a, t)| format!("; {} frees up in {:.1} h", cfg.accounts[a].name, t.saturating_sub(now) as f64 / 3_600_000.0)).unwrap_or_default();
+            Some(Move { reason: format!("this account cannot serve ({why}){then}"), kind: Leave::Blocked, target_has_quota: false, notice, resume_at_ms: first.map(|f| f.1) })
+        }
+        _ => None,
+    }
+}
+
+/// For the model to pass on: the account's login is dead and needs /login.
+fn login_notice(here: &Account) -> Option<String> {
+    login_dead(here).then(|| {
+        let dir = here.config_dir.display();
+        format!("Claude account {} (folder {dir}) is signed out. Ask the user to sign it in again: run `claude` with CLAUDE_CONFIG_DIR={dir} and type /login.", here.name)
+    })
 }
 
 /// Runs the real claude.exe untouched (environment included) and returns its exit code.
@@ -1722,7 +2162,7 @@ fn main() {
     let exe = std::env::current_exe().unwrap_or_default();
     let home = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     let state = home.join("state");
-    for sub in ["live", "sessions", "backups", "usage", "interrupted"] {
+    for sub in ["live", "sessions", "backups", "usage", "interrupted", "threads"] {
         let _ = fs::create_dir_all(state.join(sub));
     }
     let log = Log { path: state.join("router.log") };
@@ -1780,12 +2220,94 @@ fn main() {
 
     // Usage data older than fresh_minutes is asked again before a real start decides on it.
     let fresh_ms = (cfg.fresh_minutes * 60_000.0) as u64;
-    let refreshed = !info_only && !status_check && refresh_stale(&cfg, &state, &allowed, &log, fresh_ms);
+    let thread_starts = !info_only && !status_check;
+    let refreshed = thread_starts && refresh_stale(&cfg, &state, &allowed, &log, fresh_ms);
     let snapshot = read_snapshot(&cfg);
     let scores: Vec<Score> = cfg.accounts.iter().map(|a| score(&cfg, &state, &snapshot, a, &names, now_ms())).collect();
-    let (mut chosen, mut reason) = match face {
-        Some(f) if !blocked(&scores[f]) => (f, "status check or version: the face account".to_string()),
-        _ => choose(&cfg, &scores, &allowed, holder.map(|h| copies[h].account), forced.as_deref(), now),
+
+    // The thread as the strategy sees it: what it spent in earlier processes, its models, where it lives.
+    // Only a T3 chat or a claude -p run is a thread; other starts (`claude mcp list`, `claude doctor`)
+    // are neither listed nor held.
+    let kind = if streaming { Kind::T3 } else { Kind::Cli };
+    // Flags after `--` belong to another program (`claude mcp add x -- server -p 5432`).
+    let own_args: Vec<String> = text.iter().take_while(|a| *a != "--").cloned().collect();
+    let thread = thread_starts && (streaming || has_flag(&own_args, &["-p", "--print"]));
+    // A fork is a thread of its own: it is listed and keeps what it spends, where it lives, under its new id.
+    let own_id = if has_flag(&text, &["--fork-session"]) { new_session.clone().or(session.clone()) } else { session.clone() };
+    let saved = own_id.as_deref().and_then(|id| read_json(&state.join("sessions").join(format!("{id}.json")))).unwrap_or(Value::Null);
+    let holder_account = holder.map(|h| copies[h].account);
+    let mut me = Thread::new(kind, Burn::from_json(&saved["burn"]), names.iter().any(|m| m.to_lowercase().contains("fable")));
+    if kind == Kind::T3 {
+        me.account = holder_account;
+        me.home = saved["home"].as_str().and_then(|n| cfg.accounts.iter().position(|a| a.name == n)).or(holder_account);
+        me.last_move_ms = saved["last_move_ms"].as_u64().unwrap_or(0);
+    }
+    // The transcript is written at every message: its time stands in for the last call of a thread
+    // the router kept no record of.
+    let last_call = holder.and_then(|h| copies[h].mtime.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as u64).max(me.burn.last_ms);
+    let idle_ms = now.saturating_sub(last_call);
+    let tracker = Arc::new(Tracker::new(&state, own_id.clone().filter(|_| persisted), kind, &cwd, me.burn.clone(), me.fable));
+    let use_strategy = cfg.strategy && thread && face.is_none() && forced.is_none();
+    let mut strategy_log;
+    let mut held_since: Option<u64> = None;
+    let (mut chosen, mut reason) = loop {
+        // Chosen and booked under one lock: starts seconds apart see each other in the list.
+        let (start, log_part) = locked(&threads_dir(&state).join("choose.lock"), || {
+            let now = now_ms();
+            let by_strategy = if use_strategy {
+                let (accs, others) = strategy_world(&cfg, &state, &read_snapshot(&cfg), now, own_id.as_deref());
+                strategy_start(&cfg, &World { accs: &accs, allowed: &allowed, others: &others, now }, &me, idle_ms)
+            } else {
+                None
+            };
+            let (start, log_part) = match (face, by_strategy) {
+                (Some(f), _) if !blocked(&scores[f]) => (Start::Run(f, "status check or version: the face account".to_string()), Value::Null),
+                (_, Some(s)) => s,
+                _ => {
+                    let (a, why) = choose(&cfg, &scores, &allowed, holder_account, forced.as_deref(), now);
+                    (Start::Run(a, why), Value::Null)
+                }
+            };
+            if thread && !explain {
+                match &start {
+                    Start::Run(a, _) => tracker.book(&cfg.accounts[*a].name, None),
+                    Start::Hold(p, _) => tracker.book(&cfg.accounts[p.acc].name, Some((p.at, strategy::B0_NEW))),
+                }
+            }
+            (start, log_part)
+        });
+        strategy_log = log_part;
+        match start {
+            Start::Run(a, why) => break (a, why),
+            Start::Hold(plan, why) if explain => break (plan.acc, format!("{}: {why}", if cfg.cli_max_wait_ms == 0 { "would refuse" } else { "would wait" })),
+            Start::Hold(plan, why) => {
+                let now = now_ms();
+                let first = held_since.is_none();
+                let since = *held_since.get_or_insert(now);
+                let left = (since + cfg.cli_max_wait_ms).saturating_sub(now);
+                // What the caller sees: the run would start then (its caller may decide to wait or not).
+                let clock = (plan.at / 60_000) % 1440;
+                let why = if plan.admitted { format!("{why} (at {:02}:{:02} UTC)", clock / 60, clock % 60) } else { why };
+                if left == 0 {
+                    log.write(json!({"event": "start_given_up", "args": text, "cwd": cwd, "waited_min": (now - since) / 60_000, "why": why}));
+                    tracker.finish();
+                    let waited = if cfg.cli_max_wait_ms == 0 { "not waiting: cli_max_wait_minutes in router.json is 0".to_string() } else { format!("waited {} min", (now - since) / 60_000) };
+                    eprintln!("claude-router: no Claude account has room for this run now: {why}; {waited}");
+                    std::process::exit(1);
+                }
+                if first {
+                    eprintln!("claude-router: no Claude account has room for this run now: {why}; waiting, at most {} min", left / 60_000);
+                }
+                // The held start counts on the account it is promised; it is looked at again then, or sooner.
+                me.account = Some(plan.acc);
+                me.waiting = Some((plan.acc, plan.at, strategy::B0_NEW));
+                let wake = if plan.at > now { plan.at.min(now + strategy::RECHECK_MS) } else { now + strategy::RECHECK_MS };
+                let sleep_ms = wake.saturating_sub(now).max(60_000).min(left);
+                log.write(json!({"event": "start_held", "args": text, "cwd": cwd, "why": why, "wake_in_min": sleep_ms / 60_000, "strategy": strategy_log}));
+                std::thread::sleep(Duration::from_millis(sleep_ms));
+                refresh_stale(&cfg, &state, &allowed, &log, fresh_ms);
+            }
+        }
     };
     if let (None, Some(h)) = (&resume, holder) {
         // --session-id for a transcript that already exists (a retried first turn): claude.exe
@@ -1817,6 +2339,15 @@ fn main() {
         "chosen": cfg.accounts[chosen].name,
         "reason": reason,
         "copy_from": copy_from.map(|h| cfg.accounts[copies[h].account].name.clone()),
+        "kind": kind.name(),
+        "strategy": strategy_log,
+        "live_threads": if thread_starts {
+            // Also clears the list of routers that are gone, whichever rules choose.
+            let others = live_threads(&cfg, &state, now_ms(), own_id.as_deref());
+            json!(cfg.accounts.iter().enumerate().map(|(i, a)| json!({"account": a.name, "threads": others.iter().filter(|t| t.account == Some(i)).count()})).collect::<Vec<_>>())
+        } else {
+            Value::Null
+        },
     });
     if explain {
         println!("{}", serde_json::to_string_pretty(&decision).unwrap_or_default());
@@ -1836,8 +2367,26 @@ fn main() {
             }
         }
     }
+    if thread {
+        // The account may have changed after the choice (a session id that exists, a failed copy).
+        tracker.book(&cfg.accounts[chosen].name, None);
+    }
     if let (true, Some(id)) = (persisted, session.as_deref()) {
         write_session(&state, id, &cfg.accounts[chosen].name, &models);
+    }
+    if let (true, Some(id)) = (persisted, own_id.as_deref()) {
+        if use_strategy && kind == Kind::T3 {
+            let moved = holder_account.is_some_and(|h| h != chosen);
+            let name = cfg.accounts[chosen].name.clone();
+            update_session(&state, id, |v| {
+                if moved || v["home"].is_null() {
+                    v["home"] = json!(name);
+                }
+                if moved {
+                    v["last_move_ms"] = json!(now_ms());
+                }
+            });
+        }
     }
     if let Some(note) = resume.as_deref().and_then(|id| take_interrupted_note(&state, id)) {
         // T3 passes no system prompt of its own today; if it ever does, add to it.
@@ -1863,6 +2412,7 @@ fn main() {
     // moment, before the account runs dry in the middle of a turn.
     let recheck: Option<Arc<Recheck>> = (streaming && !status_check && !info_only).then(|| {
         let (cfg, state, log, allowed, current) = (Arc::clone(&cfg), state.clone(), log.clone(), allowed.clone(), chosen);
+        let (tracker, session) = (Arc::clone(&tracker), own_id.clone());
         Arc::new(move |models: &[String], data: Data| {
             match data {
                 Data::AsIs => {}
@@ -1875,28 +2425,29 @@ fn main() {
             }
             let snapshot = read_snapshot(&cfg);
             let now = now_ms();
+            // The thread's own model says how hard to leave; its agents' models only make it move.
+            let own_models: Vec<String> = if model.is_empty() { models.to_vec() } else { vec![model.clone()] };
+            if cfg.strategy && read_forced(&state).is_none() {
+                return strategy_recheck(&cfg, &state, &snapshot, &allowed, current, &tracker, models, &own_models, session.as_deref(), now);
+            }
             let scores: Vec<Score> = cfg.accounts.iter().map(|a| score(&cfg, &state, &snapshot, a, models, now)).collect();
             let (next, why) = choose(&cfg, &scores, &allowed, Some(current), read_forced(&state).as_deref(), now);
             if next == current {
                 return None;
             }
-            // The thread's own model says how hard to leave; its agents' models only make it move.
-            let own_models: Vec<String> = if model.is_empty() { models.to_vec() } else { vec![model.clone()] };
             let here = &cfg.accounts[current];
             let kind = leave_kind(&cfg, &score(&cfg, &state, &snapshot, here, &own_models, now));
             let target_has_quota = scores[next].as_ref().is_ok_and(|q| q.left >= cfg.switch_below_percent);
             if kind == Leave::Soft && !target_has_quota {
                 return None;
             }
-            let notice = login_dead(here).then(|| {
-                let dir = here.config_dir.display();
-                format!("Claude account {} (folder {dir}) is signed out. Ask the user to sign it in again: run `claude` with CLAUDE_CONFIG_DIR={dir} and type /login.", here.name)
-            });
-            Some(Move { reason: format!("next turn goes to {}: {why}", cfg.accounts[next].name), kind, target_has_quota, notice })
+            let notice = login_notice(here);
+            Some(Move { reason: format!("next turn goes to {}: {why}", cfg.accounts[next].name), kind, target_has_quota, notice, resume_at_ms: None })
         }) as Arc<Recheck>
     });
-    let launch = Launch { cfg: &cfg, args, state: state.clone(), log: log.clone(), home, session: session.filter(|_| persisted), overage_scope, recheck };
+    let launch = Launch { cfg: &cfg, args, state: state.clone(), log: log.clone(), home, session: session.filter(|_| persisted), overage_scope, recheck, tracker: Arc::clone(&tracker) };
     let code = run(launch, &cfg.accounts[chosen], models);
+    tracker.finish();
     log.write(json!({"event": "exit", "account": cfg.accounts[chosen].name, "code": code}));
     std::process::exit(code);
 }
@@ -1911,6 +2462,7 @@ mod tests {
             config_dir: PathBuf::from(format!(r"C:\x\.{name}")),
             only_paths: only.iter().map(|p| norm_path(p)).collect(),
             exclude_paths: exclude.iter().map(|p| norm_path(p)).collect(),
+            cap: DOLLARS_PER_PERCENT.map(|x| x * 100.0),
         }
     }
 
@@ -1926,6 +2478,8 @@ mod tests {
             leave_with_tasks_below_percent: 2.0,
             face_account: None,
             route_nested: true,
+            strategy: false,
+            cli_max_wait_ms: 0,
             accounts,
         }
     }
@@ -2357,7 +2911,7 @@ mod tests {
         let a = account("a", &[], &[]);
         let asked = Mutex::new(Vec::new());
         let answer = Mutex::new(None::<Move>);
-        let mv = |kind, target_has_quota| Some(Move { reason: "next turn goes to b".into(), kind, target_has_quota, notice: None });
+        let mv = |kind, target_has_quota| Some(Move { reason: "next turn goes to b".into(), kind, target_has_quota, notice: None, resume_at_ms: None });
         let recheck = |_: &[String], data: Data| {
             asked.lock().unwrap().push(data);
             answer.lock().unwrap().take()
@@ -2432,6 +2986,22 @@ mod tests {
         turn(&["five_hour"], true);
         *answer.lock().unwrap() = mv(Leave::Blocked, false);
         assert!(decide_after_turn(&recheck, result, &seen, &dir, &log, &a, None).1.is_none());
+        // ... unless another account frees up before this one: T3 is told that time. The router does
+        // not wait for a promise that far ahead.
+        turn(&["five_hour"], true);
+        let later = now_ms() + 2 * H;
+        *answer.lock().unwrap() = Some(Move { resume_at_ms: Some(later), ..mv(Leave::Blocked, false).unwrap() });
+        let (m, e) = decide_after_turn(&recheck, result, &seen, &dir, &log, &a, None);
+        assert_eq!(events(&e)[0]["rate_limit_info"]["resetsAt"].as_u64(), Some(later / 1000));
+        assert!(matches!(m, Some((Move { kind: Leave::Blocked, .. }, false))) && seen.lock().unwrap().promised_ms.is_none());
+        // One that frees up sooner than T3 could resume anyway: the usual promise.
+        turn(&["five_hour"], true);
+        *answer.lock().unwrap() = Some(Move { resume_at_ms: Some(now_ms()), ..mv(Leave::Blocked, false).unwrap() });
+        let before = now_ms() / 1000;
+        let (_, e) = decide_after_turn(&recheck, result, &seen, &dir, &log, &a, None);
+        assert!((before + RESUME_AFTER_S..=before + RESUME_AFTER_S + 1).contains(&events(&e)[0]["rate_limit_info"]["resetsAt"].as_u64().unwrap()));
+        assert!(seen.lock().unwrap().promised_ms.is_some());
+        seen.lock().unwrap().promised_ms = None;
         // A short throttle: the newest data says stay.
         turn(&[], true);
         assert!(matches!(decide_after_turn(&recheck, result, &seen, &dir, &log, &a, None), (None, None)));
@@ -2562,5 +3132,173 @@ mod tests {
         assert_eq!(read_json(&live_path(&dir, &a)).unwrap()["n"].as_u64(), Some(80));
         assert!(!live_path(&dir, &a).with_extension("lock").exists());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_list_of_threads_forgets_routers_that_are_gone() {
+        let dir = std::env::temp_dir().join(format!("router-threads-test-{}", std::process::id()));
+        let threads = threads_dir(&dir);
+        fs::create_dir_all(&threads).unwrap();
+        let cfg = config(vec![account("a", &[], &[]), account("b", &[], &[])]);
+        let now = now_ms();
+        let (sleeper, args): (&str, &[&str]) = if cfg!(windows) { ("ping", &["-n", "60", "127.0.0.1"]) } else { ("sleep", &["60"]) };
+        let mut child = Command::new(sleeper).args(args).stdout(Stdio::null()).spawn().unwrap();
+        let mut gone = Command::new(sleeper).args(if cfg!(windows) { &["-n", "1", "127.0.0.1"][..] } else { &["0"][..] }).stdout(Stdio::null()).spawn().unwrap();
+        gone.wait().unwrap();
+        let started = process_started_ms(child.id()).unwrap();
+        let record = |name: &str, pid: u32, started_ms: u64, account: &str, last_ms: u64, waiting: Value| {
+            let mut burn = Burn::default();
+            if last_ms > 0 {
+                burn.add(last_ms, 1.0, false);
+            }
+            // A held start that stopped looking again (its process stuck) has not written for two hours.
+            let updated = if name == "stuck" { now - 2 * H } else { now };
+            write_json(&threads.join(format!("{name}.json")), &json!({"pid": pid, "started_ms": started_ms, "session": name, "kind": "t3",
+                "account": account, "booked_ms": 0, "updated_ms": updated, "burn": burn.to_json(), "fable": false, "waiting": waiting}));
+        };
+        record("live", child.id(), started, "a", now - 60_000, Value::Null);
+        record("idle", child.id(), started, "b", now - strategy::LIVE_MS - 60_000, Value::Null);
+        record("held", child.id(), started, "b", 0, json!({"account": "b", "at_ms": now + H, "b": 3.9}));
+        record("stuck", child.id(), started, "a", 0, json!({"account": "a", "at_ms": now + H, "b": 3.9}));
+        // The PC was restarted and the pid now belongs to a process that started at another time.
+        record("reused", child.id(), started - H, "a", now - 60_000, Value::Null);
+        record("killed", gone.id(), started, "a", now - 60_000, Value::Null);
+        let me = std::process::id();
+        record("mine", me, process_started_ms(me).unwrap(), "a", now - 60_000, Value::Null);
+        record("twin", child.id(), started, "a", now - 60_000, Value::Null);
+        // Writes cut short: an old one is deleted, a fresh one may be in progress.
+        fs::write(threads.join("old.tmp1"), "{").unwrap();
+        fs::File::options().write(true).open(threads.join("old.tmp1")).unwrap().set_modified(SystemTime::now() - Duration::from_secs(1200)).unwrap();
+        fs::write(threads.join("new.tmp1"), "{").unwrap();
+
+        let live = live_threads(&cfg, &dir, now, Some("twin"));
+        let mut seen: Vec<_> = live.iter().map(|t| (t.account, t.waiting)).collect();
+        seen.sort_by_key(|s| s.0);
+        assert_eq!(seen, [(Some(0), None), (Some(1), Some((1, now + H, 3.9)))]);
+        let mut left: Vec<String> = fs::read_dir(&threads).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, ["held.json", "idle.json", "live.json", "mine.json", "new.tmp1", "stuck.json", "twin.json"]);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_thread_counts_each_message_once_and_leaves_the_list_on_exit() {
+        let dir = std::env::temp_dir().join(format!("router-tracker-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        let t = Tracker::new(&dir, Some("s1".into()), Kind::T3, "D:/w", Burn::default(), false);
+        let msg = |id: &str, model: &str, out: u64| json!({"type": "assistant", "message": {"id": id, "model": model,
+            "usage": {"input_tokens": 0, "cache_read_input_tokens": 500000, "output_tokens": out}}});
+        // Not in the list until it has an account.
+        t.on_message(&msg("m1", "claude-opus-5-5", 1000));
+        assert!(!t.path.exists());
+        t.book("a", None);
+        assert_eq!(read_json(&t.path).unwrap()["account"], "a");
+        // claude writes a message once per content block with its usage repeated, the last one grown.
+        t.on_message(&msg("m1", "claude-opus-5-5", 1000));
+        t.on_message(&msg("m1", "claude-opus-5-5", 3000));
+        t.on_message(&msg("m2", "claude-fable-5-1", 1000));
+        t.on_message(&msg("m3", "<synthetic>", 1000));
+        let (burn, fable) = t.snapshot();
+        assert!((burn.cost - (3000.0 * 20.0 + 1000.0 * 50.0) / 1e6).abs() < 1e-12, "{}", burn.cost);
+        assert!((burn.fable_cost - 0.05).abs() < 1e-12 && fable);
+        t.save();
+        assert!((read_json(&t.path).unwrap()["burn"]["cost"].as_f64().unwrap() - 0.11).abs() < 1e-9);
+        t.finish();
+        assert!(!t.path.exists());
+        let kept = read_json(&dir.join("sessions").join("s1.json")).unwrap();
+        assert!((Burn::from_json(&kept["burn"]).cost - 0.11).abs() < 1e-9);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_strategy_sees_a_refusal_as_a_full_window() {
+        let dir = std::env::temp_dir().join(format!("router-view-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("live")).unwrap();
+        let log = Log { path: dir.join("log") };
+        let cfg = config(vec![account("a", &[], &[])]);
+        let a = &cfg.accounts[0];
+        let snapshot = Err("none".to_string());
+        assert!(account_view(&cfg, &dir, &snapshot, a, now_ms()).unknown);
+        let ok = br#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.25,"resetsAt":4102444800},"seven_day":{"utilization":0.5,"resetsAt":4102444800},"seven_day_fable":{"utilization":0.75,"resetsAt":4102444800}}}}"#;
+        on_rate_limit(ok, a, &dir, &log, Some("fable"));
+        let v = account_view(&cfg, &dir, &snapshot, a, now_ms());
+        assert!(!v.unknown && !v.dead);
+        assert_eq!((v.u5, v.w5_end, v.u7, v.w7_end, v.uf), (25.0, Some(4_102_444_800_000), 50.0, Some(4_102_444_800_000), 75.0));
+        let refused = |kind: &str, at: u64| format!(r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","resetsAt":{at},"rateLimitType":"{kind}"}}}}"#);
+        // Fable refused to the agents: only the Fable limit is full.
+        on_rate_limit(refused("seven_day_overage_included", 4102444800).as_bytes(), a, &dir, &log, Some("fable"));
+        let v = account_view(&cfg, &dir, &snapshot, a, now_ms());
+        assert_eq!((v.u5, v.u7, v.uf), (25.0, 50.0, 100.0));
+        // The week refused, then Fable again (its agents ask every 30 s): the week stays full until the
+        // reset the API named.
+        on_rate_limit(refused("seven_day", 4000000000).as_bytes(), a, &dir, &log, Some("fable"));
+        on_rate_limit(refused("seven_day_overage_included", 4102444800).as_bytes(), a, &dir, &log, Some("fable"));
+        let v = account_view(&cfg, &dir, &snapshot, a, now_ms());
+        assert_eq!((v.u5, v.u7, v.w7_end), (25.0, 100.0, Some(4_000_000_000_000)));
+        // The 5-hour window refused.
+        on_rate_limit(refused("five_hour", 4000000000).as_bytes(), a, &dir, &log, Some("fable"));
+        let v = account_view(&cfg, &dir, &snapshot, a, now_ms());
+        assert_eq!((v.u5, v.w5_end, v.u7), (100.0, Some(4_000_000_000_000), 50.0));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn after_a_refusal_the_strategy_waits_for_a_reset_close_by_and_leaves_softly_for_fable() {
+        let dir = std::env::temp_dir().join(format!("router-recheck-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("live")).unwrap();
+        let log = Log { path: dir.join("log") };
+        let mut cfg = config(vec![account("a", &[], &[]), account("b", &[], &[])]);
+        cfg.strategy = true;
+        let snapshot = Err("none".to_string());
+        let room = br#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.3,"resetsAt":4102444800},"seven_day":{"utilization":0.5,"resetsAt":4102444800}}}}"#;
+        on_rate_limit(room, &cfg.accounts[0], &dir, &log, Some("fable"));
+        on_rate_limit(room, &cfg.accounts[1], &dir, &log, Some("fable"));
+        let refused = |kind: &str, at_s: u64| format!(r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","resetsAt":{at_s},"rateLimitType":"{kind}"}}}}"#);
+        let tracker = Tracker::new(&dir, None, Kind::T3, "D:/w", Burn::default(), false);
+        let opus = models(&["claude-opus-5-5"]);
+        let recheck = |models: &[String]| strategy_recheck(&cfg, &dir, &snapshot, &[0, 1], 0, &tracker, models, &opus, None, now_ms());
+        // The 5-hour window of a is refused and resets in 15 min: T3 resumes the thread then, on a.
+        let soon_s = now_ms() / 1000 + 15 * 60;
+        on_rate_limit(refused("five_hour", soon_s).as_bytes(), &cfg.accounts[0], &dir, &log, Some("fable"));
+        let m = recheck(&opus).unwrap();
+        assert!(m.kind == Leave::Blocked && !m.target_has_quota && m.resume_at_ms == Some(soon_s * 1000), "{}", m.reason);
+        // In 21 min: the thread would start again in 90 s, under 20 min before the reset, and stay; so it
+        // waits for the reset too.
+        let in21_s = now_ms() / 1000 + 21 * 60;
+        on_rate_limit(refused("five_hour", in21_s).as_bytes(), &cfg.accounts[0], &dir, &log, Some("fable"));
+        let m = recheck(&opus).unwrap();
+        assert!(!m.target_has_quota && m.resume_at_ms == Some(in21_s * 1000), "{}", m.reason);
+        // It resets in 2 h: the thread goes to b now.
+        on_rate_limit(refused("five_hour", soon_s + 2 * 3600).as_bytes(), &cfg.accounts[0], &dir, &log, Some("fable"));
+        let m = recheck(&opus).unwrap();
+        assert!(m.kind == Leave::Blocked && m.target_has_quota && m.resume_at_ms.is_none() && m.reason.contains("goes to b"), "{}", m.reason);
+        // A refusal the strategy cannot see (a weekly limit of Opus alone): no time for T3 from here, it
+        // waits for the reset claude named.
+        let unseen = std::env::temp_dir().join(format!("router-recheck-test-{}-3", std::process::id()));
+        fs::create_dir_all(unseen.join("live")).unwrap();
+        on_rate_limit(room, &cfg.accounts[0], &unseen, &log, Some("fable"));
+        on_rate_limit(room, &cfg.accounts[1], &unseen, &log, Some("fable"));
+        on_rate_limit(refused("seven_day_opus", 4102444800).as_bytes(), &cfg.accounts[0], &unseen, &log, Some("fable"));
+        let m = strategy_recheck(&cfg, &unseen, &snapshot, &[0, 1], 0, &tracker, &opus, &opus, None, now_ms()).unwrap();
+        assert!(m.kind == Leave::Blocked && !m.target_has_quota && m.resume_at_ms.is_none(), "{}", m.reason);
+        let _ = fs::remove_dir_all(unseen);
+        // An Opus thread whose agents were refused Fable on a (whose own windows have room): it leaves for
+        // b, softly, not ending its background agents.
+        let fresh = std::env::temp_dir().join(format!("router-recheck-test-{}-2", std::process::id()));
+        fs::create_dir_all(fresh.join("live")).unwrap();
+        on_rate_limit(room, &cfg.accounts[0], &fresh, &log, Some("fable"));
+        on_rate_limit(room, &cfg.accounts[1], &fresh, &log, Some("fable"));
+        on_rate_limit(refused("seven_day_overage_included", 4102444800).as_bytes(), &cfg.accounts[0], &fresh, &log, Some("fable"));
+        let with_agents = models(&["claude-opus-5-5", "claude-fable-5-1"]);
+        let m = strategy_recheck(&cfg, &fresh, &snapshot, &[0, 1], 0, &tracker, &with_agents, &opus, None, now_ms()).unwrap();
+        assert!(m.kind == Leave::Soft && m.reason.contains("goes to b"), "{}", m.reason);
+        // A Fable thread there needs the Fable room itself: it leaves even while background tasks run.
+        let fable = models(&["claude-fable-5-1"]);
+        let m = strategy_recheck(&cfg, &fresh, &snapshot, &[0, 1], 0, &tracker, &fable, &fable, None, now_ms()).unwrap();
+        assert!(m.kind != Leave::Soft, "{}", m.reason);
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(fresh);
     }
 }

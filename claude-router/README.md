@@ -36,6 +36,11 @@ your app ── starts "claude.exe" ──▶ claude-router
   account can serve; passing auth errors keep an account out for 10 minutes. A thread that sits on a
   dead account moves away and the model asks you to `/login` there.
 - **Nested `claude`** started from inside a chat goes through the router too (`route_nested`).
+- **Optional strategy `fable_spread`** (`"strategy": "fable_spread"`): the router keeps a list of live threads
+  and what each one spends (from the `usage` of every answer). A new chat goes to an account whose 5-hour window
+  carries it together with the threads already there, preferring weekly quota that would otherwise expire unused;
+  a thread leaves its account only when that account is about to run out. A `claude -p` that no account can carry
+  now is refused at once, with the time it could start (or held, with `cli_max_wait_minutes`).
 
 ## Setup
 
@@ -66,6 +71,9 @@ Then point your app at `bin\claude.exe` instead of Claude Code's own `claude.exe
 | `leave_with_tasks_below_percent` | below this, leave even with background agents running (2) |
 | `fresh_minutes` / `max_snapshot_age_minutes` | how old limit data may be before it is asked again / ignored |
 | `route_nested` | route `claude` started from inside a chat |
+| `strategy` | `"fable_spread"` turns on the strategy above; without it the rules above apply |
+| `cli_max_wait_minutes` | strategy only: how long a `claude -p` may wait for room before it is refused (0) |
+| `accounts[].dollars_per_percent` | strategy only: $ of API-priced use per 1% of the 5-hour window, the week and the Fable week (`[1.75, 11.2, 4.2]`) |
 
 `%VAR%` in paths is expanded. The router reads the config on every start, so edits apply to the next
 start without rebuilding.
@@ -73,7 +81,9 @@ start without rebuilding.
 ## Files
 
 Next to the exe: `router.json` and `state\` (`router.log` with every decision, live limits, which
-thread is on which account, interrupted background tasks, backups of overwritten chat copies).
+thread is on which account, interrupted background tasks, backups of overwritten chat copies) and
+`state\threads\` (one file per running router: account, spend; files of routers that are gone are
+removed by the next router that reads the list).
 
 ## Tests
 
@@ -82,4 +92,5 @@ cargo test --release                                  # unit tests
 cargo build --release --example fake_claude
 node e2e/drive.mjs [scenario ...]                     # end to end against a fake claude.exe, no quota spent
 node e2e/summary.mjs < result.json
+node e2e/strategy.mjs [scenario ...]                  # the strategy (STRATEGY=1 node e2e/drive.mjs: old scenarios with it)
 ```
