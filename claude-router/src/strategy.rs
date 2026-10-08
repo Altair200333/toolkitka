@@ -83,6 +83,11 @@ pub fn call_cost(model: &str, usage: &Value) -> f64 {
     (n(&usage["input_tokens"]) * pi + w5 * pi * 1.25 + w1 * pi * 2.0 + n(&usage["output_tokens"]) * po) / 1e6
 }
 
+/// The output part of `call_cost`.
+pub fn output_cost(model: &str, tokens: f64) -> f64 {
+    tokens * price(model).1 / 1e6
+}
+
 fn hours(later: u64, earlier: u64) -> f64 {
     (later as f64 - earlier as f64) / H
 }

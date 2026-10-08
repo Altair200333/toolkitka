@@ -1446,7 +1446,10 @@ fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
         let is_result = contains(&line, b"\"type\":\"result\"") && top_type(&line).as_deref() == Some("result");
         // What the result answers is fixed as it is read, before it may be held below.
         let read = is_result.then(|| {
-            let end = ending(&serde_json::from_slice::<Value>(&line).unwrap_or(Value::Null));
+            let v = serde_json::from_slice::<Value>(&line).unwrap_or(Value::Null);
+            // Counted before the decision after the turn looks at what the thread spends.
+            tracker.on_result(&v);
+            let end = ending(&v);
             let s = seen.lock().unwrap();
             (s.goes_on(&end), end.own, s.pending)
         });
@@ -1516,9 +1519,14 @@ fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
                 }
             }
         } else if line.starts_with(b"{\"type\":\"stream_event\"") {
-            // The first sign of a turn while the model still thinks (T3 asks for partial messages).
-            if contains(&line, b"\"message_start\"") && serde_json::from_slice::<Value>(&line).is_ok_and(|v| v["parent_tool_use_id"].is_null() && v["event"]["type"] == "message_start") {
-                seen.lock().unwrap().answering = true;
+            if contains(&line, b"\"message_start\"") || contains(&line, b"\"message_delta\"") {
+                if let Ok(v) = serde_json::from_slice::<Value>(&line) {
+                    // The first sign of a turn while the model still thinks (T3 asks for partial messages).
+                    if v["parent_tool_use_id"].is_null() && v["event"]["type"] == "message_start" {
+                        seen.lock().unwrap().answering = true;
+                    }
+                    tracker.on_stream_event(&v);
+                }
             }
         } else if contains(&line, b"\"rate_limit_event\"") {
             if let Some(kind) = on_rate_limit(&line, account, &state, &log, overage_scope.as_deref()) {
@@ -1741,7 +1749,7 @@ fn after_turn(ctx: LeaveCtx) {
             // The job object takes claude and its agents with the router.
             log.write(json!({"event": "claude_did_not_exit", "account": account, "tasks": tasks}));
         }
-        tracker.finish();
+        tracker.finish(false);
         std::process::exit(0);
     });
 }
@@ -1910,6 +1918,11 @@ fn live_threads(cfg: &Config, state: &Path, now: u64, own_session: Option<&str>)
 
 /// This router's thread in the list of live threads, and what it spends: the usage of every API call
 /// in claude's output, priced as the limits count it (`strategy::call_cost`).
+///
+/// claude's assistant lines repeat the usage from the start of each message, so their output count is a few
+/// tokens. The final count of a main-thread message comes in its `message_delta` (T3 asks for partial
+/// messages); what is still missing (agents, runs without partial messages) is added at each `result` from
+/// the growth of its `modelUsage` (claude's running totals per model for the session).
 struct Tracker {
     path: PathBuf,
     state: PathBuf,
@@ -1922,9 +1935,23 @@ struct Tracked {
     record: Value,
     burn: Burn,
     fable: bool,
-    /// Messages counted lately, with their cost and when last seen: claude writes a message once per
-    /// content block, its usage repeated.
-    counted: Vec<(String, f64, u64)>,
+    /// Messages counted lately, with their cost, its output part and when last seen: claude writes a
+    /// message once per content block, its usage repeated.
+    counted: Vec<(String, f64, f64, u64)>,
+    /// The main-thread message being answered: its id, model and usage at its start.
+    answering: Option<(String, String, Value)>,
+    /// The model of the main thread's last message.
+    main_model: String,
+    /// `modelUsage` output tokens per model at the last result; `None` while unknown (a resumed session
+    /// the router kept no record of).
+    out_seen: Option<serde_json::Map<String, Value>>,
+    /// Output $ counted since that result: other models, Fable.
+    out_counted: [f64; 2],
+    /// The session's `outputs`: the two above as they were when claude last exited cleanly, which is where
+    /// its next process goes on from. `None`: not known.
+    kept_outputs: Option<Value>,
+    /// The totals are this session's own (not a fork kept under its parent's id): a clean exit keeps them.
+    own_outputs: bool,
     saved_ms: u64,
     booked: bool,
 }
@@ -1942,8 +1969,38 @@ impl Tracker {
             path: threads_dir(state).join(format!("{pid}-{started}.json")),
             state: state.to_path_buf(),
             session,
-            inner: Mutex::new(Tracked { record, burn, fable, counted: Vec::new(), saved_ms: 0, booked: false }),
+            inner: Mutex::new(Tracked {
+                record,
+                burn,
+                fable,
+                counted: Vec::new(),
+                answering: None,
+                main_model: String::new(),
+                out_seen: None,
+                out_counted: [0.0; 2],
+                kept_outputs: None,
+                own_outputs: false,
+                saved_ms: 0,
+                booked: false,
+            }),
         }
+    }
+
+    /// Where the session's output totals stand as claude starts. claude keeps them with the session when it
+    /// exits cleanly and goes on from them; after a crash it goes on from the ones kept before, or from zero.
+    /// `fresh`: the session starts now. `own`: the totals are this session's (see `own_outputs`).
+    fn outputs_from(&self, saved: &Value, fresh: bool, own: bool) {
+        let mut t = self.inner.lock().unwrap();
+        t.own_outputs = own;
+        let kept = match &saved["outputs"] {
+            o if own && o["seen"].is_object() => o.clone(),
+            _ if own && fresh => json!({"seen": {}, "counted": [0.0, 0.0]}),
+            _ => return,
+        };
+        t.out_seen = kept["seen"].as_object().cloned();
+        let c = &kept["counted"];
+        t.out_counted = [c[0].as_f64().unwrap_or(0.0), c[1].as_f64().unwrap_or(0.0)];
+        t.kept_outputs = Some(kept);
     }
 
     /// Puts the thread on an account in the list; a held start is promised there at `at_ms`, with
@@ -1967,8 +2024,41 @@ impl Tracker {
         }
         if let (true, Some(id)) = (session_too, &self.session) {
             let burn = t.burn.to_json();
-            update_session(&self.state, id, |v| v["burn"] = burn);
+            let outputs = t.kept_outputs.clone();
+            update_session(&self.state, id, |v| {
+                v["burn"] = burn;
+                if let Some(o) = outputs {
+                    v["outputs"] = o;
+                }
+            });
         }
+    }
+
+    /// One message's usage as seen so far: what it adds over what was counted for it before.
+    fn count(t: &mut Tracked, id: &str, model: &str, usage: &Value, now: u64) {
+        let cost = strategy::call_cost(model, usage);
+        let out = strategy::output_cost(model, usage["output_tokens"].as_f64().unwrap_or(0.0));
+        let fable = model.to_lowercase().contains("fable");
+        // A message's blocks come within its response; many agents may answer in between. The one the main
+        // thread is answering stays until its delta, however long it takes.
+        let answering = t.answering.as_ref().map(|a| a.0.clone());
+        t.counted.retain(|c| now.saturating_sub(c.3) < COUNTED_MS || answering.as_deref() == Some(c.0.as_str()));
+        let before = t.counted.iter().position(|c| c.0 == id);
+        let (cost_before, out_before) = before.map_or((0.0, 0.0), |i| (t.counted[i].1, t.counted[i].2));
+        let added = (cost - cost_before).max(0.0);
+        match before {
+            Some(i) => {
+                t.counted[i].1 = cost_before.max(cost);
+                t.counted[i].2 = out_before.max(out);
+                t.counted[i].3 = now;
+            }
+            None => t.counted.push((id.to_string(), cost, out, now)),
+        }
+        if before.is_none() || added > 0.0 {
+            t.burn.add(now, added, fable);
+        }
+        t.out_counted[fable as usize] += (out - out_before).max(0.0);
+        t.fable |= fable;
     }
 
     /// An assistant message of the main thread or an agent.
@@ -1978,27 +2068,81 @@ impl Tracker {
         if model.starts_with('<') || !m["usage"].is_object() {
             return;
         }
-        let cost = strategy::call_cost(model, &m["usage"]);
-        let fable = model.to_lowercase().contains("fable");
         let now = now_ms();
         let mut t = self.inner.lock().unwrap();
-        // A message's blocks come within its response; many agents may answer in between.
-        t.counted.retain(|c| now.saturating_sub(c.2) < COUNTED_MS);
-        let before = t.counted.iter().position(|c| c.0 == id);
-        let added = (cost - before.map_or(0.0, |i| t.counted[i].1)).max(0.0);
-        match before {
-            Some(i) => {
-                t.counted[i].1 = t.counted[i].1.max(cost);
-                t.counted[i].2 = now;
-            }
-            None => t.counted.push((id.to_string(), cost, now)),
+        if v["parent_tool_use_id"].is_null() {
+            t.main_model = model.to_string();
         }
-        if before.is_none() || added > 0.0 {
-            t.burn.add(now, added, fable);
-        }
-        t.fable |= fable;
+        Self::count(&mut t, id, model, &m["usage"], now);
         if now.saturating_sub(t.saved_ms) >= SAVE_EVERY_MS {
             self.write(&mut t, true);
+        }
+    }
+
+    /// A main-thread `message_start` or `message_delta`: the delta carries the message's final output count.
+    fn on_stream_event(&self, v: &Value) {
+        if !v["parent_tool_use_id"].is_null() {
+            return;
+        }
+        let e = &v["event"];
+        let mut t = self.inner.lock().unwrap();
+        match e["type"].as_str() {
+            Some("message_start") => {
+                let m = &e["message"];
+                t.answering = match (m["id"].as_str(), m["model"].as_str()) {
+                    (Some(id), Some(model)) if m["usage"].is_object() && !model.starts_with('<') => {
+                        t.main_model = model.to_string();
+                        Some((id.to_string(), model.to_string(), m["usage"].clone()))
+                    }
+                    _ => None,
+                };
+            }
+            Some("message_delta") => {
+                let Some((id, model, mut usage)) = t.answering.clone() else { return };
+                let Some(out) = e["usage"]["output_tokens"].as_f64() else { return };
+                usage["output_tokens"] = json!(out);
+                let now = now_ms();
+                Self::count(&mut t, &id, &model, &usage, now);
+                if now.saturating_sub(t.saved_ms) >= SAVE_EVERY_MS {
+                    self.write(&mut t, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A turn's result: the output its `modelUsage` grew by that was not counted yet. With no earlier
+    /// totals to compare, only the main thread's turn is known (`usage`). Saved by the caller once the
+    /// result is out.
+    fn on_result(&self, v: &Value) {
+        let now = now_ms();
+        let mut t = self.inner.lock().unwrap();
+        let totals = v["modelUsage"].as_object();
+        let mut spent = [0.0; 2];
+        let main_out = v["usage"]["output_tokens"].as_f64().unwrap_or(0.0);
+        let out = |u: &Value| u["outputTokens"].as_f64().unwrap_or(0.0);
+        // Totals lower than the ones claude was to go on from: it went on from others (it kept none at an exit
+        // that looked clean, or the session ran without the router); the turn counts as with no totals.
+        let seen = t.out_seen.as_ref().filter(|seen| totals.is_some_and(|tot| seen.iter().all(|(m, n)| tot.get(m).map_or(0.0, out) >= n.as_f64().unwrap_or(0.0))));
+        match (totals, seen) {
+            (Some(totals), Some(seen)) => {
+                for (model, u) in totals {
+                    let grown = out(u) - seen.get(model).and_then(Value::as_f64).unwrap_or(0.0);
+                    spent[model.to_lowercase().contains("fable") as usize] += strategy::output_cost(model, grown);
+                }
+            }
+            _ => spent[t.main_model.to_lowercase().contains("fable") as usize] += strategy::output_cost(&t.main_model, main_out),
+        }
+        for (i, fable) in [(0, false), (1, true)] {
+            let missing = spent[i] - t.out_counted[i];
+            if missing > 0.0 {
+                t.burn.add(now, missing, fable);
+                t.fable |= fable;
+            }
+        }
+        t.out_counted = [0.0; 2];
+        if let Some(totals) = totals {
+            t.out_seen = Some(totals.iter().map(|(m, u)| (m.clone(), json!(u["outputTokens"].as_f64().unwrap_or(0.0)))).collect());
         }
     }
 
@@ -2018,9 +2162,13 @@ impl Tracker {
         (t.burn.clone(), t.fable)
     }
 
-    /// The router exits: what the thread spent stays with its session, it leaves the list.
-    fn finish(&self) {
+    /// The router exits: what the thread spent stays with its session, it leaves the list. `clean`: claude
+    /// exited by itself with code 0, so it kept its totals for the session's next process.
+    fn finish(&self, clean: bool) {
         let mut t = self.inner.lock().unwrap();
+        if let (true, true, Some(seen)) = (clean, t.own_outputs, t.out_seen.clone()) {
+            t.kept_outputs = Some(json!({"seen": seen, "counted": t.out_counted}));
+        }
         if !t.booked {
             return;
         }
@@ -2247,6 +2395,8 @@ fn main() {
     let last_call = holder.and_then(|h| copies[h].mtime.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as u64).max(me.burn.last_ms);
     let idle_ms = now.saturating_sub(last_call);
     let tracker = Arc::new(Tracker::new(&state, own_id.clone().filter(|_| persisted), kind, &cwd, me.burn.clone(), me.fable));
+    let fork_under_parent = has_flag(&text, &["--fork-session"]) && new_session.is_none();
+    tracker.outputs_from(&saved, resume.is_none() && !has_flag(&own_args, &["--continue", "-c"]), !fork_under_parent);
     let use_strategy = cfg.strategy && thread && face.is_none() && forced.is_none();
     let mut strategy_log;
     let mut held_since: Option<u64> = None;
@@ -2290,7 +2440,7 @@ fn main() {
                 let why = if plan.admitted { format!("{why} (at {:02}:{:02} UTC)", clock / 60, clock % 60) } else { why };
                 if left == 0 {
                     log.write(json!({"event": "start_given_up", "args": text, "cwd": cwd, "waited_min": (now - since) / 60_000, "why": why}));
-                    tracker.finish();
+                    tracker.finish(false);
                     let waited = if cfg.cli_max_wait_ms == 0 { "not waiting: cli_max_wait_minutes in router.json is 0".to_string() } else { format!("waited {} min", (now - since) / 60_000) };
                     eprintln!("claude-router: no Claude account has room for this run now: {why}; {waited}");
                     std::process::exit(1);
@@ -2447,7 +2597,7 @@ fn main() {
     });
     let launch = Launch { cfg: &cfg, args, state: state.clone(), log: log.clone(), home, session: session.filter(|_| persisted), overage_scope, recheck, tracker: Arc::clone(&tracker) };
     let code = run(launch, &cfg.accounts[chosen], models);
-    tracker.finish();
+    tracker.finish(code == 0);
     log.write(json!({"event": "exit", "account": cfg.accounts[chosen].name, "code": code}));
     std::process::exit(code);
 }
@@ -3205,10 +3355,140 @@ mod tests {
         assert!((burn.fable_cost - 0.05).abs() < 1e-12 && fable);
         t.save();
         assert!((read_json(&t.path).unwrap()["burn"]["cost"].as_f64().unwrap() - 0.11).abs() < 1e-9);
-        t.finish();
+        t.finish(true);
         assert!(!t.path.exists());
         let kept = read_json(&dir.join("sessions").join("s1.json")).unwrap();
         assert!((Burn::from_json(&kept["burn"]).cost - 0.11).abs() < 1e-9);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn output_is_counted_from_each_message_end_and_the_rest_from_model_usage() {
+        let dir = std::env::temp_dir().join(format!("router-output-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        let opus = |n: f64| n * 20.0 / 1e6;
+        let fable = |n: f64| n * 50.0 / 1e6;
+        let start = |id: &str, model: &str| json!({"type": "stream_event", "parent_tool_use_id": null, "event": {"type": "message_start",
+            "message": {"id": id, "model": model, "usage": {"input_tokens": 100, "output_tokens": 5}}}});
+        let line = |id: &str, model: &str, agent: Value| json!({"type": "assistant", "parent_tool_use_id": agent,
+            "message": {"id": id, "model": model, "usage": {"input_tokens": 100, "output_tokens": 5}}});
+        let delta = |n: u64| json!({"type": "stream_event", "parent_tool_use_id": null, "event": {"type": "message_delta", "usage": {"output_tokens": n}}});
+        let result = |main_out: u64, totals: Value| json!({"type": "result", "usage": {"output_tokens": main_out}, "modelUsage": totals});
+        let cost = |t: &Tracker| t.snapshot().0;
+
+        // A session that starts now. The main thread's message: its lines say 5 tokens, its delta 2000.
+        let t = Tracker::new(&dir, Some("s1".into()), Kind::T3, "D:/w", Burn::default(), false);
+        t.outputs_from(&Value::Null, true, true);
+        t.book("a", None);
+        t.on_stream_event(&start("m1", "claude-opus-5-5"));
+        t.on_message(&line("m1", "claude-opus-5-5", Value::Null));
+        t.on_message(&line("m1", "claude-opus-5-5", Value::Null));
+        t.on_stream_event(&delta(2000));
+        let input = 100.0 * 4.0 / 1e6;
+        assert!((cost(&t).cost - (input + opus(2000.0))).abs() < 1e-12, "{}", cost(&t).cost);
+        // A Fable agent: no deltas, its line says 8 tokens; the result's totals say it wrote 1008.
+        t.on_message(&line("a1", "claude-fable-5-1", json!("toolu_1")));
+        t.on_result(&result(2000, json!({"claude-opus-5-5[1m]": {"outputTokens": 2000}, "claude-fable-5-1": {"outputTokens": 1008}})));
+        let b = cost(&t);
+        let fable_in = 100.0 * 10.0 / 1e6;
+        assert!((b.cost - (input + opus(2000.0) + fable_in + fable(1008.0))).abs() < 1e-12, "{}", b.cost);
+        assert!((b.fable_cost - (fable_in + fable(1008.0))).abs() < 1e-12);
+        // A turn without partial messages: only the result tells the output.
+        t.on_message(&line("m2", "claude-opus-5-5", Value::Null));
+        t.on_result(&result(500, json!({"claude-opus-5-5[1m]": {"outputTokens": 2500}, "claude-fable-5-1": {"outputTokens": 1008}})));
+        let so_far = input + opus(2000.0) + fable_in + fable(1008.0) + input + opus(500.0);
+        assert!((cost(&t).cost - so_far).abs() < 1e-12, "{}", cost(&t).cost);
+        t.finish(true);
+
+        // The next process of the same session goes on from the totals kept at that clean exit.
+        let next = |fresh: bool, own: bool| {
+            let kept = read_json(&dir.join("sessions").join("s1.json")).unwrap();
+            let t = Tracker::new(&dir, Some("s1".into()), Kind::T3, "D:/w", Burn::from_json(&kept["burn"]), true);
+            t.outputs_from(&kept, fresh, own);
+            t
+        };
+        let t = next(false, true);
+        t.book("a", None);
+        t.on_result(&result(100, json!({"claude-opus-5-5[1m]": {"outputTokens": 2600}, "claude-fable-5-1": {"outputTokens": 1008}})));
+        assert!((cost(&t).cost - (so_far + opus(100.0))).abs() < 1e-12, "{}", cost(&t).cost);
+        // A message ends after that result, then claude crashes: it keeps no totals.
+        t.on_stream_event(&start("m4", "claude-opus-5-5"));
+        t.on_stream_event(&delta(300));
+        t.finish(false);
+        let so_far = so_far + opus(100.0) + input + opus(300.0);
+
+        // The next one goes on from the totals of the last clean exit (2500), not from the crashed process's.
+        let t = next(false, true);
+        t.book("a", None);
+        t.on_stream_event(&start("m5", "claude-opus-5-5"));
+        t.on_stream_event(&delta(50));
+        t.on_result(&result(50, json!({"claude-opus-5-5[1m]": {"outputTokens": 2570}, "claude-fable-5-1": {"outputTokens": 1008}})));
+        let so_far = so_far + input + opus(70.0);
+        assert!((cost(&t).cost - so_far).abs() < 1e-12, "{}", cost(&t).cost);
+        // A turn cut short by a clean exit: claude's kept totals hold its 200 tokens, already counted.
+        t.on_stream_event(&start("m6", "claude-opus-5-5"));
+        t.on_stream_event(&delta(200));
+        t.finish(true);
+        let so_far = so_far + input + opus(200.0);
+        let t = next(false, true);
+        t.book("a", None);
+        t.on_result(&result(10, json!({"claude-opus-5-5[1m]": {"outputTokens": 2780}, "claude-fable-5-1": {"outputTokens": 1008}})));
+        let so_far = so_far + opus(10.0);
+        assert!((cost(&t).cost - so_far).abs() < 1e-12, "{}", cost(&t).cost);
+        // A compaction: no message at all, its output under a key of its own.
+        t.on_result(&result(0, json!({"claude-opus-5-5[1m]": {"outputTokens": 2780}, "claude-opus-5-5": {"outputTokens": 500}, "claude-fable-5-1": {"outputTokens": 1008}})));
+        let so_far = so_far + opus(500.0);
+        assert!((cost(&t).cost - so_far).abs() < 1e-12, "{}", cost(&t).cost);
+        t.finish(true);
+
+        // Totals lower than the kept ones (claude went on from others): only the main thread's turn counts.
+        let t = next(false, true);
+        t.book("a", None);
+        t.on_message(&line("m7", "claude-opus-5-5", Value::Null));
+        t.on_result(&result(40, json!({"claude-opus-5-5[1m]": {"outputTokens": 60}})));
+        let so_far = so_far + input + opus(40.0);
+        assert!((cost(&t).cost - so_far).abs() < 1e-12, "{}", cost(&t).cost);
+        t.save();
+
+        // A fork kept under its parent's id, its main thread on Fable with no assistant lines: the delta counts
+        // it once, as Fable, and the parent's kept totals stay as they were.
+        let kept_before = read_json(&dir.join("sessions").join("s1.json")).unwrap()["outputs"].clone();
+        let t = next(false, false);
+        t.book("a", None);
+        t.on_stream_event(&start("m8", "claude-fable-5-1"));
+        t.on_stream_event(&delta(1000));
+        t.on_result(&result(1000, json!({"claude-fable-5-1": {"outputTokens": 5000}})));
+        let b = cost(&t);
+        assert!((b.cost - (so_far + fable_in + fable(1000.0))).abs() < 1e-12, "{}", b.cost);
+        assert!((b.fable_cost - (2.0 * fable_in + fable(1008.0) + fable(1000.0))).abs() < 1e-12, "{}", b.fable_cost);
+        t.finish(true);
+        assert_eq!(read_json(&dir.join("sessions").join("s1.json")).unwrap()["outputs"], kept_before);
+
+        // A resumed session the router has no totals for: only the main thread's turn is known.
+        let t = Tracker::new(&dir, Some("s2".into()), Kind::T3, "D:/w", Burn::default(), false);
+        t.outputs_from(&Value::Null, false, true);
+        t.on_message(&line("m3", "claude-opus-5-5", Value::Null));
+        t.on_result(&result(300, json!({"claude-opus-5-5[1m]": {"outputTokens": 99999}})));
+        assert!((cost(&t).cost - (input + opus(300.0))).abs() < 1e-12, "{}", cost(&t).cost);
+        // From then on it has them.
+        t.on_result(&result(10, json!({"claude-opus-5-5[1m]": {"outputTokens": 100009}})));
+        assert!((cost(&t).cost - (input + opus(310.0))).abs() < 1e-12, "{}", cost(&t).cost);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_main_message_longer_than_the_memory_of_counted_ones_is_counted_once() {
+        let dir = std::env::temp_dir().join(format!("router-long-test-{}", std::process::id()));
+        let t = Tracker::new(&dir, None, Kind::T3, "D:/w", Burn::default(), false);
+        let usage = |out: u64| json!({"input_tokens": 10000, "output_tokens": out});
+        let mut g = t.inner.lock().unwrap();
+        g.answering = Some(("m1".into(), "claude-opus-5-5".into(), usage(5)));
+        Tracker::count(&mut g, "m1", "claude-opus-5-5", &usage(5), 0);
+        // Agents answer for longer than COUNTED_MS before the main message ends.
+        Tracker::count(&mut g, "a1", "claude-opus-5-5", &usage(5), COUNTED_MS + 1);
+        Tracker::count(&mut g, "m1", "claude-opus-5-5", &usage(2000), COUNTED_MS + 2);
+        assert!((g.burn.cost - (2.0 * 10000.0 * 4.0 + 2000.0 * 20.0 + 5.0 * 20.0) / 1e6).abs() < 1e-12, "{}", g.burn.cost);
+        drop(g);
         let _ = fs::remove_dir_all(dir);
     }
 
