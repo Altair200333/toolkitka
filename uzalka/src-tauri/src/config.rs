@@ -253,14 +253,19 @@ fn account_identity(dir: &Path, kind: Kind) -> Option<String> {
         Kind::Claude => {
             let v: Value =
                 serde_json::from_str(&fs::read_to_string(claude_config_json(dir)?).ok()?).ok()?;
-            v.pointer("/oauthAccount/accountUuid")
+            let user = v
+                .pointer("/oauthAccount/accountUuid")
                 .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| {
-                    v.pointer("/oauthAccount/emailAddress")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
+                .or_else(|| v.pointer("/oauthAccount/emailAddress").and_then(Value::as_str))?;
+            if user.trim().is_empty() {
+                return None;
+            }
+            // One login can sit in several organizations (a personal Max and a
+            // company Team on the same email); each one has its own limits.
+            match v.pointer("/oauthAccount/organizationUuid").and_then(Value::as_str) {
+                Some(org) if !org.trim().is_empty() => Some(format!("{user}/{org}")),
+                _ => Some(user.to_string()),
+            }
         }
         Kind::Codex => {
             let v: Value =
@@ -269,5 +274,66 @@ fn account_identity(dir: &Path, kind: Kind) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// A Claude config dir with only `.claude.json` in it.
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(oauth_account: Value) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "uzalka-config-{}-{}-{}", std::process::id(), crate::now_ms(), NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let body = serde_json::json!({ "oauthAccount": oauth_account });
+            fs::write(dir.join(".claude.json"), body.to_string()).unwrap();
+            Self(dir)
+        }
+
+        fn key(&self) -> Option<String> {
+            account_key(&self.0, Kind::Claude)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn same_login_in_two_organizations_is_two_accounts() {
+        let personal = TestDir::new(serde_json::json!({ "accountUuid": "u1", "organizationUuid": "org-max" }));
+        let team = TestDir::new(serde_json::json!({ "accountUuid": "u1", "organizationUuid": "org-team" }));
+        assert_eq!(personal.key().as_deref(), Some("claude:u1/org-max"));
+        assert_eq!(team.key().as_deref(), Some("claude:u1/org-team"));
+    }
+
+    #[test]
+    fn same_login_and_organization_is_one_account() {
+        let a = TestDir::new(serde_json::json!({ "accountUuid": "u1", "organizationUuid": "org" }));
+        let b = TestDir::new(serde_json::json!({ "accountUuid": "u1", "organizationUuid": "org" }));
+        assert_eq!(a.key().as_deref(), Some("claude:u1/org"));
+        assert_eq!(a.key(), b.key());
+    }
+
+    #[test]
+    fn without_organization_the_key_is_the_login() {
+        let no_org = TestDir::new(serde_json::json!({ "accountUuid": "u1" }));
+        let empty_org = TestDir::new(serde_json::json!({ "accountUuid": "u1", "organizationUuid": "" }));
+        let email_only = TestDir::new(serde_json::json!({ "emailAddress": "a@b.c", "organizationUuid": "org" }));
+        let no_login = TestDir::new(serde_json::json!({ "accountUuid": " ", "organizationUuid": "org" }));
+        assert_eq!(no_org.key().as_deref(), Some("claude:u1"));
+        assert_eq!(empty_org.key().as_deref(), Some("claude:u1"));
+        assert_eq!(email_only.key().as_deref(), Some("claude:a@b.c/org"));
+        assert_eq!(no_login.key(), None);
     }
 }
