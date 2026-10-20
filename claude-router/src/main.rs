@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use strategy::{Acc, Burn, Kind, Plan, Thread, Turn, World};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
@@ -57,12 +57,9 @@ const LEAVE_GRACE: Duration = Duration::from_secs(30);
 const BLOCKED_GRACE: Duration = Duration::from_secs(8);
 /// When a refused turn can go on on another account, T3 is told the limit resets this many seconds
 /// from now: its own auto-resume ("Continue where you left off.") then restarts the thread, and
-/// the restart comes through the router to the other account. T3 checks every 5 s.
+/// the restart comes through the router to the other account. T3 checks every 5 s. The router is
+/// gone within seconds after BLOCKED_GRACE.
 const RESUME_AFTER_S: u64 = 90;
-/// After such a promise claude's input stays open until this long before the promised time (a
-/// message T3 queued still gets through), and the router is gone this long before it.
-const PROMISE_CLOSE_BEFORE: Duration = Duration::from_secs(50);
-const PROMISE_EXIT_BEFORE: Duration = Duration::from_secs(20);
 /// A refusal stands until a reading taken at least this long after it shows room: a refresh right
 /// after the refusal may still round 99.6% down, and a request that left before it may come back
 /// allowed.
@@ -622,17 +619,30 @@ fn account_view(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, ac
     let whole = score(cfg, state, snapshot, account, &[], now);
     v.dead = matches!(&whole, Err(e) if e.contains("auth failure"));
     let (live, live_updated, live_fresh, reading) = readings(cfg, state, snapshot, account, now);
+    // When the 5-hour reading was taken: the full reading, or the live event laid over it.
+    let read_ms = reading.as_ref().map_or(0, |r| r.0);
+    let live5 = live.as_ref().is_some_and(|l| l["unified_windows"]["five_hour"].is_object()) && (read_ms > 0 || live_fresh);
+    let data_ms = read_ms.max(if live5 { live_updated } else { 0 });
+    let live_f = (read_ms > 0 || live_fresh) && live.as_ref().is_some_and(|l| live_windows(l).iter().any(|w| w.scope.as_deref() == Some("fable")));
+    let fable_ms = read_ms.max(if live_f { live_updated } else { 0 });
     let windows = merge_windows(reading, live.as_ref(), live_updated, live_fresh).unwrap_or_default();
+    let (mut named5, mut named_f) = (None, None);
     // A window that has reset is empty (and a 5-hour one is not open) until the next request.
     for w in windows.iter().filter(|w| !w.resets_ms.is_some_and(|r| r <= now)) {
         match (w.kind.as_str(), w.scope.as_deref()) {
             // A window in use with no reset named ends within 5 h: taken as the latest.
-            ("session", None) => (v.u5, v.w5_end) = (w.used, w.resets_ms.or((w.used > 0.0).then_some(now + 5 * 3_600_000))),
+            ("session", None) => {
+                (v.u5, v.w5_end) = (w.used, w.resets_ms.or((w.used > 0.0).then_some(now + 5 * 3_600_000)));
+                named5 = w.resets_ms;
+            }
             ("weekly_all", None) => v.u7 = w.used,
-            ("weekly_scoped", Some("fable")) => v.uf = w.used,
+            ("weekly_scoped", Some("fable")) => (v.uf, named_f) = (w.used, w.resets_ms),
             _ => {}
         }
     }
+    // The weekly Fable limit moves slowly: judged over 6 h.
+    v.obs5 = observed(state, account, "5h", data_ms, v.u5, named5, 3_600_000);
+    v.obsf = observed(state, account, "fable", fable_ms, v.uf, named_f, 6 * 3_600_000);
     v.w7_end = next_weekly_reset(&windows, now);
     v.unknown = !windows.iter().any(|w| w.scope.is_none() && (w.kind == "session" || w.kind == "weekly_all"));
     let live = live.unwrap_or(Value::Null);
@@ -650,6 +660,36 @@ fn account_view(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, ac
         v.uf = 100.0;
     }
     v
+}
+
+/// How fast one of the account's windows filled over the last `look_ms`, % per hour, from the readings the
+/// router decided on (`usage/<account>-<name>.json`: one per `look_ms`/60 at most, kept twice `look_ms`). It
+/// counts every process on the account, Fable workers started without the router too, and a burst the thread's
+/// own forecast smooths away (on 2026-10-20 the forecast said 1.8%/h, the 5-hour window lost 9% in the hour before
+/// the refusal). 0: readings in this window span under half of `look_ms` (use is read in whole percents: one step
+/// over 15 min would read as 4%/h). `at_ms`: when this reading was taken; `end`: the window's named reset.
+fn observed(state: &Path, account: &Account, name: &str, at_ms: u64, used: f64, end: Option<u64>, look_ms: u64) -> f64 {
+    let Some(end) = end.filter(|_| at_ms > 0) else { return 0.0 };
+    let path = state.join("usage").join(format!("{}-{name}.json", account.name));
+    let saved = read_json(&path);
+    // A file there that cannot be read keeps its history while another router may be replacing it; one left broken
+    // longer is written anew.
+    let written_lately = || fs::metadata(&path).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_none_or(|age| age < Duration::from_secs(10));
+    let keep = saved.is_some() || !path.exists() || !written_lately();
+    let mut points: Vec<(u64, f64, u64)> = saved
+        .and_then(|v| v["points"].as_array().map(|ps| ps.iter().filter_map(|p| Some((p[0].as_u64()?, p[1].as_f64()?, p[2].as_u64()?))).collect()))
+        .unwrap_or_default();
+    if keep && points.last().is_none_or(|p| at_ms >= p.0 + look_ms / 60) {
+        points.push((at_ms, used, end));
+        points.retain(|p| at_ms.saturating_sub(p.0) <= 2 * look_ms);
+        write_json(&path, &json!({"points": points.iter().map(|p| json!([p.0, p.1, p.2])).collect::<Vec<_>>()}));
+    }
+    // The same window (its named reset moves by seconds between readings), within the last look_ms.
+    let first = points.iter().filter(|p| p.2.abs_diff(end) < 10 * 60_000 && p.0 <= at_ms && at_ms - p.0 <= look_ms).min_by_key(|p| p.0);
+    match first {
+        Some(p) if at_ms - p.0 >= look_ms / 2 => ((used - p.1) / ((at_ms - p.0) as f64 / 3_600_000.0)).max(0.0),
+        _ => 0.0,
+    }
 }
 
 /// An account that will certainly fail: the API refused it, or it is signed out.
@@ -952,6 +992,33 @@ fn find_copies(cfg: &Config, id: &str) -> Vec<SessionCopy> {
     copies
 }
 
+/// The `modelUsage` of the transcript's last `cost-state` record: the totals claude goes on from when it
+/// resumes the session. claude writes one whenever it exits, also with code 1 after a stop. None: no such
+/// record (or the file cannot be read).
+fn last_cost_state(transcript: &Path, id: &str) -> Option<serde_json::Map<String, Value>> {
+    let mut f = fs::File::open(transcript).ok()?;
+    let len = f.metadata().ok()?.len();
+    // Written at an exit, so near the end: the last 4 MB first, the whole file only if they have none. Like
+    // claude, the last whole record of this session counts (one cut short when claude ended is passed over).
+    for start in [len.saturating_sub(4 << 20), 0] {
+        f.seek(SeekFrom::Start(start)).ok()?;
+        let last = BufReader::new(&f)
+            .split(b'\n')
+            .map_while(Result::ok)
+            .filter(|l| l.starts_with(b"{\"type\":\"cost-state\""))
+            .filter_map(|l| serde_json::from_slice::<Value>(&l).ok())
+            .filter(|v| v["sessionId"] == id)
+            .last();
+        if let Some(v) = last {
+            return v["modelUsage"].as_object().cloned();
+        }
+        if start == 0 {
+            break;
+        }
+    }
+    None
+}
+
 /// The newest copy; copies made by the router keep the source mtime, so ties go to the
 /// account the router last ran this session on.
 fn pick_holder(copies: &[SessionCopy], last_used: Option<usize>) -> Option<usize> {
@@ -1230,11 +1297,33 @@ fn end_claude_keep_commands(claude_pid: u32) {
     }
 }
 
+/// The router's stdin, stdout and stderr are T3's pipes. Windows gives every inheritable handle to every
+/// process started with inheritance, and claude passes them on to its background commands: a command kept
+/// alive after the router leaves would hold T3's stdout open, and T3 waits for its end before it takes the
+/// thread as stopped (on 2026-10-20 the auto-continue waited 47 min for one). Only the copies made for a
+/// child on purpose (`Stdio::inherit` duplicates the handle) are inherited after this.
+#[cfg(windows)]
+fn keep_std_handles_private() {
+    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    unsafe {
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = GetStdHandle(id);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 #[cfg(not(windows))]
 fn contain_children() {}
 
 #[cfg(not(windows))]
 fn end_claude_keep_commands(_: u32) {}
+
+#[cfg(not(windows))]
+fn keep_std_handles_private() {}
 
 /// T3 starts the router without a console; a console program started from there would get
 /// its own visible window unless we ask for none.
@@ -1366,7 +1455,8 @@ fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
         .env(MARK_VAR, &account.config_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        // Its own pipe, passed on by the router: T3's stderr does not outlive the router in a kept command.
+        .stderr(Stdio::piped());
     for v in CREDENTIAL_VARS {
         cmd.env_remove(v);
     }
@@ -1389,6 +1479,16 @@ fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
         }
     };
     let child_pid = child.id();
+    let stderr_ended = child.stderr.take().map(|mut err| {
+        let (done, ended) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = io::copy(&mut err, &mut io::stderr());
+            // Our stderr closed: the rest is read and dropped, or claude would block on a full pipe.
+            let _ = io::copy(&mut err, &mut io::sink());
+            let _ = done.send(());
+        });
+        ended
+    });
     let child_stdin = Arc::new(Mutex::new(child.stdin.take()));
     // How many user messages T3 has sent so far; a switch is called off if this changes.
     let user_messages = Arc::new(AtomicU64::new(0));
@@ -1562,7 +1662,13 @@ fn run(launch: Launch, account: &Account, models: Vec<(String, u64)>) -> i32 {
             }
         }
     }
-    child.wait().ok().and_then(|s| s.code()).unwrap_or(1)
+    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+    // claude's last words on stderr go out before the router exits (T3 shows them for a failed start); a
+    // process that outlived claude and holds the pipe does not hold the router.
+    if let Some(ended) = stderr_ended {
+        let _ = ended.recv_timeout(Duration::from_secs(2));
+    }
+    code
 }
 
 /// At the end of a turn: should the next one run elsewhere (and was that forced by the test flag)?
@@ -1648,10 +1754,11 @@ struct LeaveCtx {
 /// If background tasks keep claude running, it is ended a little later; background commands stay
 /// alive, and the next process tells the model about them.
 ///
-/// A Blocked move closes the input only between turns: BLOCKED_GRACE after the last result, so a
-/// message T3 queued still reaches claude (and fails there with the real reason), and after a
-/// promise to T3 not before PROMISE_CLOSE_BEFORE ahead of the latest promised time. The router is
-/// gone PROMISE_EXIT_BEFORE before that time. A running turn is never cut: T3 would fail it.
+/// A Blocked move closes the input only between turns, BLOCKED_GRACE after the last result: a message
+/// T3 queued still reaches claude (and fails there with the real reason). Not later: a message the
+/// user sends after that goes to a new process, on an account that can answer it (on 2026-10-08 a
+/// retry 30 s after the refusal reached the same empty account). The router is gone long before the
+/// time it promised T3. A running turn is never cut: T3 would fail it.
 fn after_turn(ctx: LeaveCtx) {
     let messages_before = ctx.user_messages.load(Ordering::SeqCst);
     std::thread::spawn(move || {
@@ -1689,8 +1796,7 @@ fn after_turn(ctx: LeaveCtx) {
                     let s = seen.lock().unwrap();
                     (s.turn_open(), s.last_result_ms)
                 };
-                let not_before = (last + ms(BLOCKED_GRACE)).max(promise().map_or(0, |at| at.saturating_sub(ms(PROMISE_CLOSE_BEFORE))));
-                if open || now_ms() < not_before {
+                if open || now_ms() < last + ms(BLOCKED_GRACE) {
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
@@ -1722,17 +1828,16 @@ fn after_turn(ctx: LeaveCtx) {
         }
         let closed = now_ms();
         log.write(json!({"event": "leaving_after_result", "account": account, "reason": m.reason, "kind": format!("{:?}", m.kind), "promised_ms": promise()}));
-        // Without background tasks claude exits within seconds, and the router with it. A turn
-        // still running (claude answering a finished background task) is let finish. Input closed
-        // late (a turn ran close to the promised time): that later turn is what T3 goes by, claude
-        // still gets a few seconds to exit by itself.
-        // T3 writing to the closed input fails its turn only when the router exits: exit at once.
+        // Without background tasks claude exits within a second (0.5-0.6 s in the log), and the router
+        // with it; it gets 30 s before it is ended. Background tasks keep it running: it is ended at once,
+        // as a message T3 sends to the closed input now would fail when the router exits. A turn still
+        // running (claude answering a finished background task) is let finish.
         loop {
-            let (open, late, promised) = {
+            let (open, late, tasks) = {
                 let s = seen.lock().unwrap();
-                (s.turn_open(), s.late_input, s.promised_ms.filter(|&at| at > closed))
+                (s.turn_open(), s.late_input, !s.tasks.is_empty())
             };
-            let exit_at = promised.map_or(closed + 30_000, |at| at.saturating_sub(ms(PROMISE_EXIT_BEFORE)).max(closed + 5_000));
+            let exit_at = if tasks { closed } else { closed + 30_000 };
             if (now_ms() >= exit_at || late) && !open {
                 break;
             }
@@ -1750,6 +1855,7 @@ fn after_turn(ctx: LeaveCtx) {
             log.write(json!({"event": "claude_did_not_exit", "account": account, "tasks": tasks}));
         }
         tracker.finish(false);
+        log.write(json!({"event": "exit", "account": account, "code": 0, "claude_ended": true}));
         std::process::exit(0);
     });
 }
@@ -2003,6 +2109,20 @@ impl Tracker {
         t.kept_outputs = Some(kept);
     }
 
+    /// A resumed session goes on from the totals of its last `cost-state` record: a better start than the
+    /// totals kept at the last clean exit, which a stop (code 1, totals saved) leaves behind. Output after
+    /// those totals was already counted live by the router that ran it.
+    fn outputs_at(&self, model_usage: &serde_json::Map<String, Value>) {
+        let mut t = self.inner.lock().unwrap();
+        if !t.own_outputs {
+            return;
+        }
+        let seen: serde_json::Map<String, Value> = model_usage.iter().map(|(m, u)| (m.clone(), json!(u["outputTokens"].as_f64().unwrap_or(0.0)))).collect();
+        t.kept_outputs = Some(json!({"seen": seen, "counted": [0.0, 0.0]}));
+        t.out_seen = Some(seen);
+        t.out_counted = [0.0; 2];
+    }
+
     /// Puts the thread on an account in the list; a held start is promised there at `at_ms`, with
     /// this burn counted for it.
     fn book(&self, account: &str, waiting: Option<(u64, f64)>) {
@@ -2241,7 +2361,7 @@ fn strategy_start(cfg: &Config, world: &World, me: &Thread, idle_ms: u64) -> Opt
 /// cold move waits for the next start. An account that cannot serve is left in any case, as by the
 /// default rules; when no account has room, T3 may resume the thread when the first one frees up.
 #[allow(clippy::too_many_arguments)]
-fn strategy_recheck(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, allowed: &[usize], current: usize, tracker: &Tracker, models: &[String], own_models: &[String], session: Option<&str>, now: u64) -> Option<Move> {
+fn strategy_recheck(cfg: &Config, state: &Path, snapshot: &Result<Value, String>, allowed: &[usize], current: usize, tracker: &Tracker, models: &[String], own_models: &[String], session: Option<&str>, now: u64, log: &Log) -> Option<Move> {
     let (accs, others) = strategy_world(cfg, state, snapshot, now, session);
     let world = World { accs: &accs, allowed, others: &others, now };
     let (burn, fable) = tracker.snapshot();
@@ -2279,6 +2399,16 @@ fn strategy_recheck(cfg: &Config, state: &Path, snapshot: &Result<Value, String>
                 .or_else(|| wait_own.then_some((current, own_at)));
             let then = first.map(|(a, t)| format!("; {} frees up in {:.1} h", cfg.accounts[a].name, t.saturating_sub(now) as f64 / 3_600_000.0)).unwrap_or_default();
             Some(Move { reason: format!("this account cannot serve ({why}){then}"), kind: Leave::Blocked, target_has_quota: false, notice, resume_at_ms: first.map(|f| f.1) })
+        }
+        Turn::Stay(why) => {
+            // Staying on little room is what ends in a refusal: the numbers behind it are kept.
+            let v = &accs[current];
+            if (100.0 - v.u5).min(100.0 - v.u7) < 20.0 {
+                let b_i = me.bhat(now, v.cap[0]);
+                let row = world.rows(&me, b_i, strategy::R_STAY, None).into_iter().find(|r| r.acc == current).map(|r| r.to_json(&here.name));
+                log.write(json!({"event": "stays_low", "account": here.name, "why": why, "burn": b_i, "observed5": v.obs5, "row": row}));
+            }
+            None
         }
         _ => None,
     }
@@ -2326,6 +2456,7 @@ fn main() {
         std::process::exit(2);
     }
     contain_children();
+    keep_std_handles_private();
 
     // A `claude` started inside a chat comes here too. If its caller chose the account or
     // brought its own credentials, that is not the router's business.
@@ -2397,6 +2528,11 @@ fn main() {
     let tracker = Arc::new(Tracker::new(&state, own_id.clone().filter(|_| persisted), kind, &cwd, me.burn.clone(), me.fable));
     let fork_under_parent = has_flag(&text, &["--fork-session"]) && new_session.is_none();
     tracker.outputs_from(&saved, resume.is_none() && !has_flag(&own_args, &["--continue", "-c"]), !fork_under_parent);
+    if let (Some(id), Some(h), false) = (resume.as_deref(), holder, has_flag(&text, &["--fork-session"])) {
+        if let Some(totals) = last_cost_state(&copies[h].slug_dir.join(format!("{id}.jsonl")), id) {
+            tracker.outputs_at(&totals);
+        }
+    }
     let use_strategy = cfg.strategy && thread && face.is_none() && forced.is_none();
     let mut strategy_log;
     let mut held_since: Option<u64> = None;
@@ -2578,7 +2714,7 @@ fn main() {
             // The thread's own model says how hard to leave; its agents' models only make it move.
             let own_models: Vec<String> = if model.is_empty() { models.to_vec() } else { vec![model.clone()] };
             if cfg.strategy && read_forced(&state).is_none() {
-                return strategy_recheck(&cfg, &state, &snapshot, &allowed, current, &tracker, models, &own_models, session.as_deref(), now);
+                return strategy_recheck(&cfg, &state, &snapshot, &allowed, current, &tracker, models, &own_models, session.as_deref(), now, &log);
             }
             let scores: Vec<Score> = cfg.accounts.iter().map(|a| score(&cfg, &state, &snapshot, a, models, now)).collect();
             let (next, why) = choose(&cfg, &scores, &allowed, Some(current), read_forced(&state).as_deref(), now);
@@ -3477,6 +3613,97 @@ mod tests {
     }
 
     #[test]
+    fn the_observed_burn_is_the_window_growth_over_the_last_hour() {
+        let dir = std::env::temp_dir().join(format!("router-observed-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("usage")).unwrap();
+        let a = account("a", &[], &[]);
+        let (t0, end, min) = (1_792_430_000_000u64, 1_792_440_000_000u64, 60_000u64);
+        let seen = |t: u64, used: f64, end: Option<u64>| observed(&dir, &a, "5h", t, used, end, 3_600_000);
+        assert_eq!(seen(t0, 50.0, Some(end)), 0.0);
+        // Under 30 min of readings: not known yet.
+        assert_eq!(seen(t0 + 10 * min, 55.0, Some(end)), 0.0);
+        assert!((seen(t0 + 30 * min, 60.0, Some(end + 3_000)) - 20.0).abs() < 1e-9);
+        // A reading within a minute of the last one is not kept, but is judged.
+        assert!((seen(t0 + 30 * min + 30_000, 61.0, Some(end)) - 11.0 / (30.5 / 60.0)).abs() < 1e-9);
+        assert_eq!(read_json(&dir.join("usage").join("a-5h.json")).unwrap()["points"].as_array().unwrap().len(), 3);
+        // Only the last hour counts: from 60% at +30 min to 70% at +80 min.
+        assert!((seen(t0 + 80 * min, 70.0, Some(end)) - 12.0).abs() < 1e-9);
+        // A new window, a window with no named reset, no reading.
+        assert_eq!(seen(t0 + 81 * min, 5.0, Some(end + 5 * 3_600_000)), 0.0);
+        assert_eq!(seen(t0 + 82 * min, 80.0, None), 0.0);
+        assert_eq!(seen(0, 80.0, Some(end)), 0.0);
+        // A file that cannot be read (another router replacing it) is not overwritten; one broken for longer is.
+        let file = dir.join("usage").join("a-5h.json");
+        fs::write(&file, "{\"points\": [[1").unwrap();
+        assert_eq!(seen(t0 + 90 * min, 75.0, Some(end)), 0.0);
+        assert_eq!(fs::read_to_string(&file).unwrap(), "{\"points\": [[1");
+        fs::File::options().write(true).open(&file).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(60)).unwrap();
+        assert_eq!(seen(t0 + 91 * min, 75.0, Some(end)), 0.0);
+        assert_eq!(read_json(&file).unwrap()["points"].as_array().unwrap().len(), 1);
+        // The weekly Fable limit, over 6 h: a reading every 6 min at most, known after 3 h.
+        let week = end + 100 * 3_600_000;
+        let fable = |t: u64, used: f64| observed(&dir, &a, "fable", t, used, Some(week), 6 * 3_600_000);
+        assert_eq!(fable(t0, 40.0), 0.0);
+        assert_eq!(fable(t0 + 120 * min, 44.0), 0.0);
+        assert!((fable(t0 + 180 * min, 46.0) - 2.0).abs() < 1e-9);
+        assert_eq!(read_json(&dir.join("usage").join("a-fable.json")).unwrap()["points"].as_array().unwrap().len(), 3);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_stopped_process_is_not_counted_again_by_the_next_one() {
+        // 6d92a69c (2026-10-11): a stop exits with code 1, yet claude keeps its totals in a cost-state record and
+        // the next process goes on from them.
+        let dir = std::env::temp_dir().join(format!("router-stop-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        let opus = |n: f64| n * 20.0 / 1e6;
+        let input = 100.0 * 4.0 / 1e6;
+        let result = |out: u64| json!({"type": "result", "usage": {"output_tokens": 0}, "modelUsage": {"claude-opus-5-5[1m]": {"outputTokens": out}}});
+        let cost = |t: &Tracker| t.snapshot().0.cost;
+        let t = Tracker::new(&dir, Some("s1".into()), Kind::T3, "D:/w", Burn::default(), false);
+        t.outputs_from(&Value::Null, true, true);
+        t.book("a", None);
+        t.on_result(&result(1000));
+        // A message after that result, then the stop.
+        t.on_stream_event(&json!({"type": "stream_event", "parent_tool_use_id": null, "event": {"type": "message_start",
+            "message": {"id": "m2", "model": "claude-opus-5-5", "usage": {"input_tokens": 100, "output_tokens": 5}}}}));
+        t.on_stream_event(&json!({"type": "stream_event", "parent_tool_use_id": null, "event": {"type": "message_delta", "usage": {"output_tokens": 400}}}));
+        t.finish(false);
+        let so_far = opus(1000.0) + input + opus(400.0);
+        assert!((cost(&t) - so_far).abs() < 1e-12, "{}", cost(&t));
+
+        // The transcript: an older record, then the one the stop wrote.
+        let transcript = dir.join("s1.jsonl");
+        let state = |out: u64| format!(r#"{{"type":"cost-state","sessionId":"s1","totalCostUSD":1.0,"modelUsage":{{"claude-opus-5-5[1m]":{{"outputTokens":{out},"costUSD":1.0}}}}}}"#);
+        // After them a record of another session and one cut short as claude ended: both passed over.
+        let other = state(9000).replace("\"s1\"", "\"s0\"");
+        let cut = &state(9000)[..60];
+        fs::write(&transcript, format!("{{\"type\":\"user\"}}\n{}\n{{\"type\":\"assistant\"}}\n{}\n{{\"type\":\"user\"}}\n{other}\n{cut}\n", state(700), state(1400))).unwrap();
+        let totals = last_cost_state(&transcript, "s1").unwrap();
+        assert_eq!(totals["claude-opus-5-5[1m]"]["outputTokens"], 1400);
+        assert!(last_cost_state(&dir.join("none.jsonl"), "s1").is_none());
+
+        // The next process: its first result's totals grew by 100 over the record.
+        let kept = read_json(&dir.join("sessions").join("s1.json")).unwrap();
+        let t = Tracker::new(&dir, Some("s1".into()), Kind::T3, "D:/w", Burn::from_json(&kept["burn"]), false);
+        t.outputs_from(&kept, false, true);
+        t.outputs_at(&totals);
+        t.book("a", None);
+        t.on_result(&result(1500));
+        assert!((cost(&t) - (so_far + opus(100.0))).abs() < 1e-12, "{}", cost(&t));
+        // Kept for the process after it too.
+        t.finish(true);
+        assert_eq!(read_json(&dir.join("sessions").join("s1.json")).unwrap()["outputs"]["seen"]["claude-opus-5-5[1m]"], 1500.0);
+
+        // A fork kept under its parent's id goes on from no totals of its own: the record is not used.
+        let t = Tracker::new(&dir, Some("s1".into()), Kind::T3, "D:/w", Burn::default(), false);
+        t.outputs_from(&Value::Null, false, false);
+        t.outputs_at(&totals);
+        assert!(t.inner.lock().unwrap().out_seen.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn a_main_message_longer_than_the_memory_of_counted_ones_is_counted_once() {
         let dir = std::env::temp_dir().join(format!("router-long-test-{}", std::process::id()));
         let t = Tracker::new(&dir, None, Kind::T3, "D:/w", Burn::default(), false);
@@ -3538,7 +3765,7 @@ mod tests {
         let refused = |kind: &str, at_s: u64| format!(r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","resetsAt":{at_s},"rateLimitType":"{kind}"}}}}"#);
         let tracker = Tracker::new(&dir, None, Kind::T3, "D:/w", Burn::default(), false);
         let opus = models(&["claude-opus-5-5"]);
-        let recheck = |models: &[String]| strategy_recheck(&cfg, &dir, &snapshot, &[0, 1], 0, &tracker, models, &opus, None, now_ms());
+        let recheck = |models: &[String]| strategy_recheck(&cfg, &dir, &snapshot, &[0, 1], 0, &tracker, models, &opus, None, now_ms(), &log);
         // The 5-hour window of a is refused and resets in 15 min: T3 resumes the thread then, on a.
         let soon_s = now_ms() / 1000 + 15 * 60;
         on_rate_limit(refused("five_hour", soon_s).as_bytes(), &cfg.accounts[0], &dir, &log, Some("fable"));
@@ -3561,7 +3788,7 @@ mod tests {
         on_rate_limit(room, &cfg.accounts[0], &unseen, &log, Some("fable"));
         on_rate_limit(room, &cfg.accounts[1], &unseen, &log, Some("fable"));
         on_rate_limit(refused("seven_day_opus", 4102444800).as_bytes(), &cfg.accounts[0], &unseen, &log, Some("fable"));
-        let m = strategy_recheck(&cfg, &unseen, &snapshot, &[0, 1], 0, &tracker, &opus, &opus, None, now_ms()).unwrap();
+        let m = strategy_recheck(&cfg, &unseen, &snapshot, &[0, 1], 0, &tracker, &opus, &opus, None, now_ms(), &log).unwrap();
         assert!(m.kind == Leave::Blocked && !m.target_has_quota && m.resume_at_ms.is_none(), "{}", m.reason);
         let _ = fs::remove_dir_all(unseen);
         // An Opus thread whose agents were refused Fable on a (whose own windows have room): it leaves for
@@ -3572,11 +3799,11 @@ mod tests {
         on_rate_limit(room, &cfg.accounts[1], &fresh, &log, Some("fable"));
         on_rate_limit(refused("seven_day_overage_included", 4102444800).as_bytes(), &cfg.accounts[0], &fresh, &log, Some("fable"));
         let with_agents = models(&["claude-opus-5-5", "claude-fable-5-1"]);
-        let m = strategy_recheck(&cfg, &fresh, &snapshot, &[0, 1], 0, &tracker, &with_agents, &opus, None, now_ms()).unwrap();
+        let m = strategy_recheck(&cfg, &fresh, &snapshot, &[0, 1], 0, &tracker, &with_agents, &opus, None, now_ms(), &log).unwrap();
         assert!(m.kind == Leave::Soft && m.reason.contains("goes to b"), "{}", m.reason);
         // A Fable thread there needs the Fable room itself: it leaves even while background tasks run.
         let fable = models(&["claude-fable-5-1"]);
-        let m = strategy_recheck(&cfg, &fresh, &snapshot, &[0, 1], 0, &tracker, &fable, &fable, None, now_ms()).unwrap();
+        let m = strategy_recheck(&cfg, &fresh, &snapshot, &[0, 1], 0, &tracker, &fable, &fable, None, now_ms(), &log).unwrap();
         assert!(m.kind != Leave::Soft, "{}", m.reason);
         let _ = fs::remove_dir_all(dir);
         let _ = fs::remove_dir_all(fresh);

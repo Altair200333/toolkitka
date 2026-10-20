@@ -29,6 +29,11 @@ const Q: f64 = 1.55;
 const MARGIN5: f64 = 10.0;
 const LOOK5: f64 = 0.5;
 const LOOK7: f64 = 3.0;
+/// The 5-hour window is left early, under R_LEAVE5 % left or running out within LOOK5_EARLY h (before its reset),
+/// for an account with at least R_TARGET5 % left (on 2026-10-20 a thread rode one from 18% left into a refusal).
+const R_LEAVE5: f64 = 15.0;
+const LOOK5_EARLY: f64 = 1.0;
+const R_TARGET5: f64 = 25.0;
 const D7: f64 = 1.28;
 const DF: f64 = 1.59;
 const SD7: f64 = 8.0;
@@ -259,6 +264,11 @@ pub struct Acc {
     pub uf: f64,
     /// $ of limit cost in a whole 5-hour window, week, Fable week.
     pub cap: [f64; 3],
+    /// What the 5-hour window was seen to fill by over the last hour, % per hour, other processes on the account
+    /// included (0: not known). The burn there is at least this.
+    pub obs5: f64,
+    /// The same for the weekly Fable limit, % of it per hour over the last hours.
+    pub obsf: f64,
 }
 
 /// How one account ranks for one thread.
@@ -359,7 +369,8 @@ impl World<'_> {
             let feas = !v.dead && !v.unknown && hm >= r;
             let tau5 = v.w5_end.map_or(5.0, |e| hours(e, now));
             let u5 = if v.w5_end.is_some() { v.u5 } else { 0.0 };
-            let load = self.load(a);
+            // What the account was seen to spend includes this thread when it runs there.
+            let load = self.load(a).max(if me.account == Some(a) { v.obs5 - b_i } else { v.obs5 });
             let p5 = (u5 + (load + Q * b_i) * tau5) / 100.0;
             let t5 = h5 / (load + b_i).max(1e-6);
             // An unknown weekly reset is taken as a week away: the least slack.
@@ -393,11 +404,16 @@ impl World<'_> {
     /// The best key among accounts whose window carries the thread; else the account whose window
     /// lasts longest among those with room; else none.
     pub fn choose(&self, me: &Thread, b_i: f64, r: f64, exclude: Option<usize>) -> (Option<usize>, Vec<Row>) {
+        self.choose_where(me, b_i, r, exclude, |_| true)
+    }
+
+    /// `choose` among the accounts whose row passes `keep`.
+    fn choose_where(&self, me: &Thread, b_i: f64, r: f64, exclude: Option<usize>, keep: impl Fn(&Row) -> bool) -> (Option<usize>, Vec<Row>) {
         let rows = self.rows(me, b_i, r, exclude);
         let w7 = |a: usize| self.accs[a].w7_end.unwrap_or(u64::MAX);
         let round6 = |x: f64| (x * 1e6).round();
         let mut best: Option<&Row> = None;
-        for row in rows.iter().filter(|r| r.safe) {
+        for row in rows.iter().filter(|r| r.safe && keep(r)) {
             let better = match best {
                 None => true,
                 Some(b) => {
@@ -410,7 +426,7 @@ impl World<'_> {
             }
         }
         if best.is_none() {
-            for row in rows.iter().filter(|r| r.feas) {
+            for row in rows.iter().filter(|r| r.feas && keep(r)) {
                 if best.is_none_or(|b| row.t5 > b.t5) {
                     best = Some(row);
                 }
@@ -462,6 +478,24 @@ impl World<'_> {
         }
     }
 
+    /// Hours until the week and the Fable week of the row's account run out with the thread burning `b_i` there
+    /// (a share `f` of it Fable), and whether each forces a move off it: under R_STAY left or LOOK7 h, before the reset.
+    fn weeks(&self, me: &Thread, r: &Row, b_i: f64, f: f64) -> (f64, f64, bool, bool) {
+        let v = &self.accs[r.acc];
+        let b = r.load + b_i;
+        let (kap, kapf) = (v.cap[0] / v.cap[1], v.cap[0] / v.cap[2]);
+        // Fable workers started without the router spend it too: what the account was seen to spend is the least
+        // (this thread in it when it runs there).
+        let seen = v.obsf / kapf - if me.account == Some(r.acc) { f * b_i } else { 0.0 };
+        let bf = self.load_fable(r.acc).max(seen) + f * b_i;
+        let t7 = r.h7 / (kap * b).max(1e-9);
+        let tf = r.hf / (kapf * bf).max(1e-9);
+        let tau7 = v.w7_end.map_or(168.0, |e| hours(e, self.now));
+        let forced7 = (r.h7 < R_STAY || t7 < LOOK7) && t7 < tau7;
+        let forced_f = ((f > F_NEED && r.hf < R_STAY) || (f > 0.2 && tf < LOOK7)) && tf < tau7;
+        (t7, tf, forced7, forced_f)
+    }
+
     /// The decision for a thread on `me.account`, idle this long (0 right after a turn): leave when the
     /// account is about to run out, or when the cache is cold anyway and another account is clearly better.
     pub fn at_turn(&self, me: &Thread, idle_ms: u64) -> Turn {
@@ -483,16 +517,10 @@ impl World<'_> {
             return Turn::Stay("no quota data for this account".into());
         }
         let b = cur.load + b_i;
-        let (kap, kapf) = (v.cap[0] / v.cap[1], v.cap[0] / v.cap[2]);
-        let bf = self.load_fable(a) + f * b_i;
-        let t7 = cur.h7 / (kap * b).max(1e-9);
-        let tf = cur.hf / (kapf * bf).max(1e-9);
-        let tau7 = v.w7_end.map_or(168.0, |e| hours(e, now));
         // The limit resets within 20 min (5 h) or before the account runs out (week, Fable): waiting is cheaper
         // than a hot move.
         let forced5 = (cur.h5 < R_STAY || (cur.t5 < cur.tau5 && cur.t5 < LOOK5)) && cur.tau5 > 1.0 / 3.0;
-        let forced7 = (cur.h7 < R_STAY || t7 < LOOK7) && t7 < tau7;
-        let forced_f = ((f > F_NEED && cur.hf < R_STAY) || (f > 0.2 && tf < LOOK7)) && tf < tau7;
+        let (t7, tf, forced7, forced_f) = self.weeks(me, cur, b_i, f);
         if v.dead || forced5 || forced7 || forced_f {
             let why = if v.dead {
                 "the account's login is failing".to_string()
@@ -507,6 +535,23 @@ impl World<'_> {
             let Some(tgt) = tgt else { return Turn::Stay(format!("{why}, but no other account has room")) };
             let hmin = cur.h5.min(cur.h7).min(if f > F_NEED { cur.hf } else { 100.0 });
             return Turn::Move { to: tgt, forced: true, low: v.dead || hmin < R_STAY, why };
+        }
+        // Only a window that runs out before its reset is left early; and only for one with room to spare that lasts
+        // longer than staying would, its week and Fable week too (a move to an account the thread soon leaves again,
+        // maybe back here, costs a hot cache twice).
+        let early5 = cur.t5 < cur.tau5 && (cur.h5 < R_LEAVE5 || cur.t5 < LOOK5_EARLY) && cur.tau5 > 1.0 / 3.0;
+        if early5 {
+            let lasts = |r: &Row| {
+                // The thread's burn in the target's own units (smaller limits fill faster).
+                let b_t = me.bhat(now, self.accs[r.acc].cap[0]);
+                let t5 = r.h5 / (r.load + b_t).max(1e-6);
+                let (_, _, forced7, forced_f) = self.weeks(me, r, b_t, f);
+                r.h5 >= R_TARGET5 && (t5 >= r.tau5 || t5 >= LOOK5_EARLY.max(cur.t5)) && !forced7 && !forced_f
+            };
+            if let (Some(tgt), _) = self.choose_where(me, b_i, R_STAY, Some(a), lasts) {
+                let why = format!("the 5-hour window is nearly used up ({:.0}% left, {:.1} h at {:.1}%/h, resets in {:.1} h)", cur.h5, cur.t5, b, cur.tau5);
+                return Turn::Move { to: tgt, forced: true, low: false, why };
+            }
         }
         if idle_ms >= H_MS && now.saturating_sub(me.last_move_ms) > T_COOL_MS {
             let (tgt, rows2) = self.choose(me, b_i, R_NEW, None);
@@ -531,7 +576,7 @@ impl World<'_> {
         let run = || self.others.iter().filter(move |x| x.waiting.is_none() && x.account == Some(a));
         let promised = || self.others.iter().filter_map(move |x| x.waiting.filter(|w| w.0 == a).map(|w| (x, w.1)));
         if let Some(w5) = v.w5_end.filter(|&w| w > t) {
-            let mut u = v.u5 + run().map(|x| x.admitted_burn(now, c5)).sum::<f64>() * hours(w5, now);
+            let mut u = v.u5 + run().map(|x| x.admitted_burn(now, c5)).sum::<f64>().max(v.obs5) * hours(w5, now);
             u += promised().map(|(x, tp)| x.admitted_burn(now, c5) * hours(w5, now.max(tp)).max(0.0)).sum::<f64>();
             return (u + Q * b_i * hours(w5, t)) / 100.0;
         }
@@ -629,6 +674,84 @@ mod tests {
         assert_eq!(surv(Kind::T3, -1.0), 1.0);
     }
 
+    #[test]
+    fn the_five_hour_window_is_left_early_for_one_that_lasts() {
+        let now = 1_792_436_000_000;
+        let acc = |used5: f64, end_h: f64, obs5: f64| Acc {
+            u5: used5,
+            w5_end: Some(now + (end_h * H) as u64),
+            u7: 12.0,
+            w7_end: Some(now + 100 * H_MS),
+            cap: [175.0, 1120.0, 420.0],
+            obs5,
+            ..Acc::default()
+        };
+        let allowed = [0, 1];
+        let mut me = Thread::new(Kind::T3, Burn::default(), false);
+        me.account = Some(0);
+        let turn = |accs: &[Acc]| World { accs, allowed: &allowed, others: &[], now }.at_turn(&me, 0);
+        // 2026-10-20 01:48: 9% left, the account seen spending 9%/h, the reset 1.7 h away. Leaving at under 5% or
+        // within 0.5 h would have stayed (1 h at 9%/h); the thread rode into a refusal 11 min later.
+        match turn(&[acc(91.0, 1.7, 9.0), acc(30.0, 3.0, 0.0)]) {
+            Turn::Move { to: 1, forced: true, low: false, why } => assert!(why.contains("nearly used up"), "{why}"),
+            t => panic!("{t:?}"),
+        }
+        // 12-14% left that last until the reset at this pace: no hot move.
+        assert!(matches!(turn(&[acc(88.0, 3.0, 0.0), acc(30.0, 3.0, 0.0)]), Turn::Stay(_)));
+        assert!(matches!(turn(&[acc(86.0, 2.0, 0.0), acc(30.0, 3.0, 0.0)]), Turn::Stay(_)));
+        // Running out before the reset, but the other account has little room to spare (13%), or lasts shorter there
+        // (it spends 20%/h: 1.3 h against 2.6 h here): it stays (no moves back and forth).
+        assert!(matches!(turn(&[acc(88.0, 4.0, 0.0), acc(87.0, 4.0, 0.0)]), Turn::Stay(_)));
+        assert!(matches!(turn(&[acc(90.0, 4.0, 0.0), acc(70.0, 3.0, 20.0)]), Turn::Stay(_)));
+        // Nor to one whose week runs out (7% left, 1.9 h at the 20%/h seen there): the next turn would force the
+        // thread back here.
+        assert!(matches!(turn(&[acc(88.0, 4.0, 0.0), Acc { u7: 93.0, ..acc(20.0, 3.0, 20.0) }]), Turn::Stay(_)));
+        // Where it does go, the next turn keeps it there.
+        let accs = [acc(88.0, 4.0, 0.0), acc(30.0, 3.0, 0.0)];
+        let Turn::Move { to, .. } = turn(&accs) else { panic!() };
+        let mut moved = me.clone();
+        moved.account = Some(to);
+        assert!(matches!(World { accs: &accs, allowed: &allowed, others: &[], now }.at_turn(&moved, 0), Turn::Stay(_)));
+        // The reset is within 20 min: waiting is cheaper.
+        assert!(matches!(turn(&[acc(91.0, 0.3, 9.0), acc(30.0, 3.0, 0.0)]), Turn::Stay(_)));
+        // 20% left, the thread's own forecast 3.9%/h, but the account seen spending 50%/h (another process there):
+        // it runs out within 0.5 h, a forced move as before.
+        match turn(&[acc(80.0, 3.0, 50.0), acc(5.0, 3.0, 0.0)]) {
+            Turn::Move { to: 1, forced: true, why, .. } => assert!(why.contains("runs out") && why.contains("50.0%/h"), "{why}"),
+            t => panic!("{t:?}"),
+        }
+        assert!(matches!(turn(&[acc(80.0, 3.0, 0.0), acc(5.0, 3.0, 0.0)]), Turn::Stay(_)));
+        // A Fable thread, 20% of the Fable week left: 12 h at its own pace, but the account was seen spending 10%/h
+        // of it (Fable workers started without the router): it runs out in 2 h.
+        let mut fab = Thread::new(Kind::T3, Burn::default(), true);
+        fab.account = Some(0);
+        let fable = |obsf: f64| [Acc { uf: 80.0, obsf, ..acc(10.0, 3.0, 0.0) }, acc(10.0, 3.0, 0.0)];
+        let turn_f = |accs: &[Acc]| World { accs, allowed: &allowed, others: &[], now }.at_turn(&fab, 0);
+        assert!(matches!(turn_f(&fable(0.0)), Turn::Stay(_)));
+        match turn_f(&fable(10.0)) {
+            Turn::Move { to: 1, forced: true, why, .. } => assert!(why.contains("Fable limit runs out") && why.contains("2.0 h"), "{why}"),
+            t => panic!("{t:?}"),
+        }
+        // Running out here (12% left, 3.1 h, the reset in 4 h); the other account has 14% of the Fable week left and
+        // was seen spending 4%/h of it without this thread: with it there it runs out in 2.5 h, not 3.5 h.
+        assert!(matches!(turn_f(&[acc(88.0, 4.0, 0.0), Acc { uf: 86.0, obsf: 4.0, ..acc(30.0, 3.0, 0.0) }]), Turn::Stay(_)));
+        // The other account's limits are a quarter of these (regie-team): the same dollars are four times the share of
+        // its window. Its week (20%/h seen there) carries the thread 3 h+ in this account's units, under 3 h in its
+        // own, and the next turn would send the thread back here.
+        let mut burn = Burn::default();
+        for k in 0..9 {
+            burn.add(now - (80 - 10 * k) * 60_000, 0.6, false);
+        }
+        let mut heavy = Thread::new(Kind::T3, burn, false);
+        heavy.account = Some(0);
+        let small = [44.0, 560.0, 210.0];
+        let (b_here, b_there) = (heavy.bhat(now, 175.0), heavy.bhat(now, small[0]));
+        let h7 = LOOK7 * small[0] / small[1] * (20.0 + (b_here + b_there) / 2.0);
+        assert!(b_there > 2.0 * b_here && h7 >= R_STAY, "{b_here} {b_there} {h7}");
+        let accs = [acc(88.0, 4.5, b_here + 3.0), Acc { cap: small, u7: 100.0 - h7, ..acc(20.0, 2.0, 20.0) }];
+        assert!(matches!(World { accs: &accs, allowed: &allowed, others: &[], now }.at_turn(&heavy, 0), Turn::Stay(_)));
+    }
+
     fn thread(v: &Value) -> Thread {
         let idx = |k: &str| v[k].as_u64().map(|x| x as usize);
         Thread {
@@ -679,6 +802,8 @@ mod tests {
                     w7_end: a["w7_end"].as_u64(),
                     uf: a["uf"].as_f64().unwrap(),
                     cap: [0, 1, 2].map(|k| a["cap"][k].as_f64().unwrap()),
+                    obs5: a["obs5"].as_f64().unwrap(),
+                    obsf: a["obsf"].as_f64().unwrap(),
                 })
                 .collect();
             let allowed: Vec<usize> = (0..accs.len()).collect();

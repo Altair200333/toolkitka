@@ -177,6 +177,10 @@ Object.assign(SCENARIOS, {
     closeAfter: 400000,
   },
 });
+// The two above, with the background task and T3's message inside BLOCKED_GRACE: later than that the router
+// is gone and the message starts a new process (2026-10-20).
+SCENARIOS.r3_wake_eats_count_in_grace = { ...SCENARIOS.r3_wake_eats_count, a: { ...SCENARIOS.r3_wake_eats_count.a, wake: { ...wake, after_ms: 4000 } }, queued: { ...SCENARIOS.r3_wake_eats_count.queued, after: 5000 } };
+SCENARIOS.r4_long_wake_in_grace = { ...SCENARIOS.r4_long_wake, a: { ...SCENARIOS.r4_long_wake.a, wake: { ...SCENARIOS.r4_long_wake.a.wake, after_ms: 4000 } }, queued: { ...SCENARIOS.r4_long_wake.queued, after: 5000 } };
 // T3 puts every rate_limit_event into its active turn, so the 3-day
 // reset of the agents refused in claude's own turn lands in T3's waiting turn; when that turn fails on the
 // limit the router must answer with "resets in 90 s" for both kinds (see t3_resume_in_s of its result).
@@ -198,6 +202,19 @@ SCENARIOS.r5_own_refusal_then_limit = {
   queued: { after: 21000, change: { turn: [JSON.stringify(refusal("five_hour", 3 * 3600)), JSON.stringify(limitError)], result: JSON.stringify(failed) } },
   closeAfter: 150000,
 };
+// claude's report of the windows after a request that went through.
+const allowed = (u5, resetH) => ({
+  type: "rate_limit_event",
+  rate_limit_info: { status: "allowed", resetsAt: nowS() + resetH * 3600, rateLimitType: "five_hour", isUsingOverage: false,
+    unifiedWindows: { five_hour: { utilization: u5, resetsAt: nowS() + resetH * 3600 }, seven_day: { utilization: 0.5, resetsAt: nowS() + 2 * 86400 } } },
+  uuid: "11111111-2222-4333-8444-666666666666",
+  session_id: "$SID",
+});
+// The turn ends with 9% left in a's 5-hour window, used up (2.3 h at 3.9%/h) before its reset in 4 h; b has room.
+// With the strategy the thread leaves a early (under 15%), after the turn; a background task holds that (if a does
+// run out, the refusal path takes over). The default rules leave too (under 10%) and stay for background tasks.
+SCENARIOS.early5 = { a: { usage: usage(30, 50, 2, 10), turn: [allowed(0.91, 4), said("claude-opus-5-5", null)] }, second: true, closeAfter: 60000 };
+SCENARIOS.early5_with_command = { a: { usage: usage(30, 50, 2, 10), turn: [allowed(0.91, 4), said("claude-opus-5-5", null)], command: "ping -n 120 127.0.0.1 > nul" }, closeAfter: 60000 };
 const B = { usage: usage(10, 20, 5, 10), turn: [said("claude-opus-5-5", null)] };
 
 // Output lines go to the fake as text, keys in claude's order ("type" first).
@@ -301,7 +318,11 @@ async function runOnce(dir, sc, sid, resume) {
   });
   let stderr = "";
   child.stderr.on("data", (d) => (stderr += d));
-  const exited = new Promise((r) => child.on("exit", (code) => r({ code, at: sentAt ? Date.now() - sentAt : Date.now() - started })));
+  // T3's SDK ends a query at the end of stdout, not at the exit: a process that kept a copy of the
+  // router's stdout keeps T3's query open.
+  let eofAt = null;
+  child.stdout.on("end", () => (eofAt = Date.now()));
+  const exited = new Promise((r) => child.on("exit", (code) => r({ code, at: sentAt ? Date.now() - sentAt : Date.now() - started, ms: Date.now() })));
   await sleep(1500);
   if (!resume && sc.afterStart) sc.afterStart(dir);
   await sleep(Math.max(0, (resume ? 0 : sc.waitBeforeMessage ?? 0) - 1500));
@@ -320,10 +341,14 @@ async function runOnce(dir, sc, sid, resume) {
     exit = await Promise.race([exited, sleep(10000).then(() => null)]);
     if (!exit) child.kill();
   }
+  // stdout must end with the router: give it 10 s (null: still open then).
+  for (let i = 0; exit && eofAt === null && i < 100; i++) await sleep(100);
+  const eof_after_exit_ms = exit && eofAt !== null ? eofAt - exit.ms : null;
+  if (exit) delete exit.ms;
   // The router must be gone before the latest reset it promised T3 (T3 keeps the latest and resumes then).
   const promises = out.filter((e) => e.promise_t !== undefined && e.resets_in_s < 600).map((e) => e.promise_t);
   const margin_s = promises.length && exit ? Math.round((Math.max(...promises) - exit.at) / 100) / 10 : null;
-  return { exit, closedByDriver, out, stderr: stderr.trim(), margin_s };
+  return { exit, eof_after_exit_ms, closedByDriver, out, stderr: stderr.trim(), margin_s };
 }
 
 function alive(pid) {
