@@ -216,7 +216,9 @@ async fn router_usage(State(ctx): State<Ctx>, headers: HeaderMap, uri: Uri) -> R
     let refreshed = stale || refreshing();
     let wait = async {
         if stale {
-            refresh_all(&app).await; // returns at once when one is already running
+            // Dropping the waiter on timeout/disconnect must not cancel the refresh.
+            let app = app.clone();
+            let _ = tauri::async_runtime::spawn(async move { refresh_all(&app).await }).await;
         }
         while refreshing() {
             tokio::time::sleep(Duration::from_millis(200)).await;

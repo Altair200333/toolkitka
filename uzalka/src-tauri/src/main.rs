@@ -285,11 +285,29 @@ fn twin_takes_over(kept: Option<&Result<providers::ProviderUsage, String>>, atte
     attempt_ok || kept.map_or(true, |r| matches!(r, Err(e) if login_error(e)))
 }
 
+/// Releases the refresh slot even if the future is cancelled or unwinds.
+struct RefreshGuard<'a>(&'a AtomicBool);
+
+impl<'a> RefreshGuard<'a> {
+    fn acquire(refreshing: &'a AtomicBool) -> Option<Self> {
+        refreshing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self(refreshing))
+    }
+}
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 async fn refresh_all(app: &AppHandle) {
     let state: State<AppState> = app.state();
-    if state.refreshing.swap(true, Ordering::SeqCst) {
+    let Some(_refresh) = RefreshGuard::acquire(&state.refreshing) else {
         return; // a refresh is already in flight
-    }
+    };
     state.last_refresh_ms.store(now_ms(), Ordering::SeqCst);
 
     let cfg = config::load_config();
@@ -411,7 +429,6 @@ async fn refresh_all(app: &AppHandle) {
     *state.snapshot.lock().unwrap() = snap.clone();
     update_tray(app, &snap);
     let _ = app.emit("snapshot", &snap);
-    state.refreshing.store(false, Ordering::SeqCst);
 }
 
 // ------------------------------------------------------------- commands ----
@@ -763,6 +780,29 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_guard_excludes_overlap_and_releases_on_completion() {
+        let refreshing = AtomicBool::new(false);
+        let guard = RefreshGuard::acquire(&refreshing).unwrap();
+        assert!(RefreshGuard::acquire(&refreshing).is_none());
+        assert!(refreshing.load(Ordering::SeqCst));
+        drop(guard);
+        assert!(!refreshing.load(Ordering::SeqCst));
+        assert!(RefreshGuard::acquire(&refreshing).is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelled_refresh_allows_retry() {
+        let refreshing = AtomicBool::new(false);
+        let refresh = async {
+            let _guard = RefreshGuard::acquire(&refreshing).unwrap();
+            std::future::pending::<()>().await;
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(1), refresh).await.is_err());
+        assert!(!refreshing.load(Ordering::SeqCst));
+        assert!(RefreshGuard::acquire(&refreshing).is_some());
+    }
 
     fn account(path: &str, key: Option<&str>) -> config::Account {
         config::Account {
