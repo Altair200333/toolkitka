@@ -2,7 +2,7 @@
 
 ## Human Lore
 
-<img src="docs/assets/mascot-hud.png" align="right" width="200" alt="toolkitka">
+<img src="docs/assets/mascot-hud.webp" align="right" width="200" alt="toolkitka">
 
 Solving few common issues when working with agents, 
 - one is managing and automatically and efficiently routing session between claude accounts (and transfering live sessions to avoid hitting limits)
@@ -24,15 +24,15 @@ Coding agents are tireless, capable, and completely oblivious to their own rate 
 - **chat-history-mcp** keeps a local searchable archive of your past chats so the agent can look things up itself.
 
 ```text
-   ┌──────────┐    limits     ┌───────────────┐    the right account    ┌─────────────┐
-   │  uzalka  │ ────────────▶ │ claude-router │ ──────────────────────▶ │ Claude Code │
-   └──────────┘   127.0.0.1   └───────────────┘   (the chat moves too)  └─────────────┘
-     tray icon                  drop-in claude.exe                              │
-                                                                                │ chats on disk
-                                                                                ▼
-          "what did we decide about X last week?"                 ┌──────────────────┐
-   any MCP client ──────────────────────────────────────────────▶ │ chat-history-mcp │
-                                                                  └──────────────────┘
+   +----------+     limits     +---------------+    the right account    +-------------+
+   |  uzalka  | -------------> | claude-router | ----------------------> | Claude Code |
+   +----------+    127.0.0.1   +---------------+   (the chat moves too)  +-------------+
+     tray icon                   drop-in claude.exe                             |
+                                                                                | chats on disk
+                                                                                v
+          "what did we decide about X last week?"                 +------------------+
+   any MCP client ----------------------------------------------> | chat-history-mcp |
+                                                                  +------------------+
 ```
 
 The tools are independent: use one, two, or all three. The router works best with `uzalka` running, but can query Claude Code for limits on its own.
@@ -56,14 +56,14 @@ A native Windows tray app (Rust + Tauri 2, plain HTML/JS popup) that tracks your
 A drop-in `claude.exe` wrapper that routes sessions across your Claude accounts. Your editor or CLI launches it like normal Claude Code; the router picks the best account, migrates the session transcript if needed, and spawns the real `claude.exe` with `CLAUDE_CONFIG_DIR` pointed at that account.
 
 ```text
-your app ── starts "claude.exe" ──▶ claude-router
+your app -- starts "claude.exe" --> claude-router
                                       1. reads account limits (from uzalka + live stream events)
                                       2. locates the newest copy of this chat
                                       3. picks an account and copies the transcript over if needed
                                       4. spawns the real claude.exe with CLAUDE_CONFIG_DIR set
-                                      │
-                                      ▼
-                                   claude.exe  ◀── stdin/stdout passed through
+                                      |
+                                      v
+                                   claude.exe  <-- stdin/stdout passed through
 ```
 
 - Routes new chats to the account whose weekly quota resets soonest (among accounts with at least 20% left), so expiring quota gets spent first.
