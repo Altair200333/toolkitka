@@ -1,5 +1,6 @@
 # Toolkitka
 
+<img src="docs/assets/mascot-hud.png" align="right" width="320" alt="toolkitka">
 
 ## Human Lore
 
