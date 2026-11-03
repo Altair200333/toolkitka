@@ -1,8 +1,8 @@
 # Toolkitka
 
-<img src="docs/assets/mascot-hud.png" align="right" width="320" alt="toolkitka">
-
 ## Human Lore
+
+<img src="docs/assets/mascot-hud.png" align="right" width="200" alt="toolkitka">
 
 Solving few common issues when working with agents, 
 - one is managing and automatically and efficiently routing session between claude accounts (and transfering live sessions to avoid hitting limits)
@@ -10,6 +10,8 @@ Solving few common issues when working with agents,
 - chat history, when working in claude/codex/t3 its always needed to reference some of the past chats, sometimes pretty vaguely
 
 So nothing crazy, but very light and efficient, robust and tested in hundreds of hours of work small tools to make daily life easier
+
+<br clear="right"/>
 
 ## Slop Zone
 
